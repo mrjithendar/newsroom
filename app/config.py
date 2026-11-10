@@ -89,6 +89,7 @@ class Settings:
     docs_allowlist: tuple[str, ...] = field(default=DEFAULT_DOCS_ALLOWLIST)
     ask_cache_ttl_s: int = 900
     ask_top_k: int = 6
+    ask_min_score: float = 0.15  # cosine floor for retrieved chunks; calibrate from seo_ask_log (RAG.md)
     ask_retention_days: int = 30
     production: bool = False
     otel_endpoint: str = ""
@@ -155,6 +156,7 @@ def load_settings() -> Settings:
         docs_allowlist=docs or DEFAULT_DOCS_ALLOWLIST,
         ask_cache_ttl_s=_int("ASK_BLOG_CACHE_TTL_SECONDS", Settings.ask_cache_ttl_s),
         ask_top_k=max(1, min(12, _int("ASK_BLOG_TOP_K", Settings.ask_top_k))),
+        ask_min_score=max(0.0, min(0.95, _float("ASK_BLOG_MIN_SCORE", Settings.ask_min_score))),
         ask_retention_days=_int("ASK_BLOG_RETENTION_DAYS", Settings.ask_retention_days),
         production=env.get("APP_ENV", "") == "production",
         otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),

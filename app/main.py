@@ -88,12 +88,12 @@ class Container:
     reindex_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     bg: list[asyncio.Task[Any]] = field(default_factory=list)
 
-    async def reindex(self, article_ids: list[str] | None = None, full: bool = False) -> dict[str, int]:
+    async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
             if not getattr(self.index, "available", False) or not hasattr(self.index, "reindex"):
                 return {"articles": 0, "embedded": 0, "unchanged": 0, "deleted": 0}
             articles = await self.deps.web.published_articles()
-            return await self.index.reindex(articles, full=full, only=set(article_ids) if article_ids else None)
+            return await self.index.reindex(articles, full=full, only=set(article_ids) if article_ids else None, force=force)
 
 
 def _crews(deps: Deps) -> None:

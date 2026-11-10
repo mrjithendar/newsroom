@@ -81,6 +81,7 @@ class PublishInput(_In):
 class ReindexInput(_In):
     article_ids: list[str] | None = Field(default=None, max_length=200)
     full: bool = False
+    force: bool = False  # skip the index safety guard (IndexSafetyError) after checking the article list
 
 
 class ReportInput(_In):
@@ -155,6 +156,7 @@ class PublishState(RunState):
 class ReindexState(RunState):
     article_ids: list[str] | None = None
     full: bool = False
+    force: bool = False
     result: dict[str, Any] = Field(default_factory=dict)
 
 

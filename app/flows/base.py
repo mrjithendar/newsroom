@@ -39,7 +39,7 @@ class Deps:
     optimization_crew: Callable[[], Any] | None = None
     editorial_crew: Callable[[], Any] | None = None
     report_crew: Callable[[], Any] | None = None
-    reindex: Callable[[list[str] | None, bool], Awaitable[dict[str, int]]] | None = None
+    reindex: Callable[..., Awaitable[dict[str, int]]] | None = None  # (article_ids, full, force=False)
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     verify_delays: tuple[float, ...] = (40.0, 30.0, 60.0)
     extra: dict[str, Any] = field(default_factory=dict)
