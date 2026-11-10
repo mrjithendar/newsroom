@@ -23,7 +23,7 @@ CALENDAR = "33333333-3333-4333-8333-333333333333"
 
 
 def settings(**kw: Any) -> Settings:
-    base = Settings(agent_token="t" * 40, callback_token="c" * 40, anthropic_api_key="sk-ant-test", monthly_budget_usd=10.0, ask_daily_budget_usd=1.0, ask_enabled=True, fanout_concurrency=2, crew_timeout_s=20, crew_max_tokens_per_run=50_000, crew_max_iter=3, public_mcp_enabled=True, admin_mcp_enabled=True, mcp_allowed_hosts=("jithendar.com", "testserver"))
+    base = Settings(agent_token="t" * 40, callback_token="c" * 40, anthropic_api_key="sk-ant-test", monthly_budget_usd=10.0, ask_daily_budget_usd=1.0, ask_enabled=True, fanout_concurrency=2, crew_timeout_s=20, crew_max_tokens_per_run=50_000, crew_max_iter=3, public_mcp_enabled=True, admin_mcp_enabled=True, mcp_allowed_hosts=("jithendar.com", "testserver"), ask_min_score=0.15)  # the fake retriever scores word overlap, not bge cosine
     return replace(base, **kw)
 
 

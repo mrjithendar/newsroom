@@ -12,9 +12,10 @@ from __future__ import annotations
 from typing import Any
 
 from ..runs import FlowSpec, RunError
-from ..state import JobInput, LinkingInput, NewArticleInput, NoInput, OptimizeInput, PublishInput, ReindexInput, ReportInput, WeeklyInput
+from ..state import JobInput, LinkingInput, MlInput, NewArticleInput, NoInput, OptimizeInput, PublishInput, ReindexInput, ReportInput, WeeklyInput
 from .jobs import Ga4SyncFlow, GscSyncFlow, TechAuditFlow
 from .maintenance import AskGapsFlow, InternalLinkingFlow, ReindexFlow
+from .ml import SeoMlFlow
 from .new_article import NewArticleFlow
 from .news import (
     NEWS_INPUTS,
@@ -57,6 +58,8 @@ SPECS: dict[str, FlowSpec] = {
     "reindex_flow": FlowSpec("reindex_flow", ReindexFlow.create, ReindexInput, _site),
     "ask_gaps_flow": FlowSpec("ask_gaps_flow", AskGapsFlow.create, NoInput, _site),
     "report_flow": FlowSpec("report_flow", ReportFlow.create, ReportInput, lambda i: str(i.get("period", "weekly"))),
+    # v5 SEO-side ML (docs/seo/ML.md): one run at a time, site-wide.
+    "seo_ml_flow": FlowSpec("seo_ml_flow", SeoMlFlow.create, MlInput, _site),
     # News desk (docs/news/ARCHITECTURE.md). Lock targets: one active run per job; one per job + story for drafts.
     "news_dispatch_flow": FlowSpec("news_dispatch_flow", NewsDispatchFlow.create, NEWS_INPUTS["news_dispatch_flow"], _site),
     "news_job_flow": FlowSpec("news_job_flow", NewsJobFlow.create, NEWS_INPUTS["news_job_flow"], lambda i: f"job:{i['job_id']}"),
@@ -72,7 +75,7 @@ NEWS_FLOWS = frozenset(n for n in SPECS if n.startswith("news_"))
 APPROVAL_ONLY = frozenset({"publish_flow"})
 DRAFTING_FLOWS = ("optimize_article_flow", "new_article_flow")
 MCP_KICKOFF_ALLOWLIST = frozenset({"news_job_flow", "optimize_article_flow", "new_article_flow", "internal_linking_flow", "tech_audit_flow", "report_flow", "gsc_sync_flow", "ga4_sync_flow"})
-CRON_FLOWS = frozenset({"news_dispatch_flow", "news_train_flow", "news_style_review_flow", "gsc_sync_flow", "ga4_sync_flow", "tech_audit_flow", "weekly_recommendations_flow", "internal_linking_flow", "reindex_flow", "ask_gaps_flow", "report_flow"})
+CRON_FLOWS = frozenset({"news_dispatch_flow", "news_train_flow", "news_style_review_flow", "gsc_sync_flow", "ga4_sync_flow", "tech_audit_flow", "weekly_recommendations_flow", "internal_linking_flow", "reindex_flow", "ask_gaps_flow", "report_flow", "seo_ml_flow"})
 
 
 def check_kickoff(name: str, triggered_by: str) -> None:

@@ -274,7 +274,8 @@ async def classify_and_novelty(d: DeskDeps, rec: RunRecorder, cluster_ids: list[
             except Exception:
                 hits = []
             if hits:
-                h = hits[0]
+                # Best cosine, not the first hit: hybrid retrieval orders by fused rank (Hit.score is always cosine).
+                h = max(hits, key=lambda x: x.score)
                 c["site_match"] = {"path": h.path, "title": h.title, "score": round(float(h.score), 4), "update_candidate": float(h.score) >= 0.86}
                 if float(h.score) >= 0.86 and c.get("status") == "new":
                     c["status"] = "update_candidate"

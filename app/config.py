@@ -69,7 +69,7 @@ class Settings:
     anthropic_api_key: str = ""
     draft_model: str = "claude-sonnet-5-5"
     classify_model: str = "claude-haiku-5-5"
-    monthly_budget_usd: float = 10.0
+    monthly_budget_usd: float = 15.0  # v5: COSTS.md estimates the admin month at $8–10.5
     ask_daily_budget_usd: float = 1.0
     ask_enabled: bool = False
     crew_max_tokens_per_run: int = 150_000  # ≈ a normal 4-agent run is ~80k (docs/seo/COSTS.md)
@@ -89,7 +89,9 @@ class Settings:
     docs_allowlist: tuple[str, ...] = field(default=DEFAULT_DOCS_ALLOWLIST)
     ask_cache_ttl_s: int = 900
     ask_top_k: int = 6
-    ask_min_score: float = 0.15  # cosine floor for retrieved chunks; calibrate from seo_ask_log (RAG.md)
+    # Cosine pre-filter for retrieved chunks (bge-small). v5: calibrated on the eval set = the highest floor that loses
+    # no expected answer (RAG.md "Score calibration"); was 0.15. Other embedding providers need their own value.
+    ask_min_score: float = 0.66
     ask_retention_days: int = 30
     production: bool = False
     otel_endpoint: str = ""

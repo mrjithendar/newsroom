@@ -28,9 +28,10 @@ FLOWS = {
     "news_train_flow",
     "news_style_review_flow",
     "news_playground_flow",
+    "seo_ml_flow",
 }
 CREWS = {"optimization", "editorial", "report", "news"}
-PURPOSES = {"draft", "regenerate", "crew", "report", "ask_grade", "ask_answer", "classify", "news.crew", "news.classify", "news.vision", "news.style", "news.playground", "other"}
+PURPOSES = {"draft", "regenerate", "crew", "report", "ask_grade", "ask_answer", "classify", "ml_label", "news.crew", "news.classify", "news.vision", "news.style", "news.playground", "other"}
 MCP_SERVERS = {"public", "admin"}
 _BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800)
 
@@ -49,6 +50,24 @@ ASK_BUDGET_RATIO = Gauge("seo_ask_budget_used_ratio", "Today's Ask-the-Blog spen
 LAST_SUCCESS = Gauge("seo_flow_last_success_timestamp_seconds", "Last succeeded run per flow (from seo_flow_runs).", ["flow"], registry=REGISTRY)
 MCP_REQUESTS = Counter("seo_mcp_requests_total", "MCP tool/resource/prompt calls.", ["server", "tool", "status"], registry=REGISTRY)
 MCP_AUTH_FAILURES = Counter("seo_mcp_auth_failures_total", "Rejected MCP bearer tokens (missing, invalid, expired, revoked, wrong audience).", ["server"], registry=REGISTRY)
+# v5 RAG quality (docs/seo/RAG.md). Labels: `mode` ∈ {vector, hybrid}.
+RAG_CHUNK_TOKENS = Histogram(
+    "seo_rag_chunk_tokens", "Tokens of each embedded chunk input (title + heading path + text), at reindex.", buckets=(32, 64, 128, 192, 256, 320, 384, 448, 480, 512, 1024), registry=REGISTRY
+)
+RAG_CHUNKS_TRUNCATED = Counter("seo_rag_chunks_truncated_total", "Embedded inputs longer than the model's 512 tokens (their tail is not embedded). Must stay 0.", registry=REGISTRY)
+RAG_RETRIEVAL_MODE = Gauge("seo_rag_retrieval_mode", "1 for the retrieval mode in use (RAG_MODE).", ["mode"], registry=REGISTRY)
+RAG_EVAL_RECALL3 = Gauge("seo_rag_eval_recall_at_3", "Recall@3 of the latest retrieval evaluation run against the live index.", registry=REGISTRY)
+RAG_MODES = {"vector", "hybrid"}
+
+# v5 SEO-side ML (docs/seo/ML.md). `model` ∈ ML_MODELS, `status` ∈ ML_RUN_STATUSES, `metric` ∈ the fixed names in
+# app/seo_ml/train.py EXPORTED: all bounded.
+ML_MODELS = {"decay", "query_clusters", "intent", "priority", "related"}
+ML_RUN_STATUSES = {"activated", "rule_kept", "needs_review", "fallback_to_rule", "failed"}
+ML_TRAIN_RUNS = Counter("seo_ml_train_runs_total", "seo_ml_flow model trainings by outcome (fallback_to_rule = an active model lost to the rule).", ["model", "status"], registry=REGISTRY)
+ML_MODEL_ACTIVE = Gauge("seo_ml_model_active", "1 when the model's latest version is active (the web app uses it in auto mode).", ["model"], registry=REGISTRY)
+ML_METRIC = Gauge("seo_ml_metric", "Held-out metric of the latest version (model) and of the rule on the same data.", ["model", "metric"], registry=REGISTRY)
+ML_FLOW_CONSECUTIVE_FAILURES = Gauge("seo_ml_flow_consecutive_failures", "Failed seo_ml_flow runs in a row (from seo_flow_runs).", registry=REGISTRY)
+
 MCP_DURATION = Histogram("seo_mcp_request_duration_seconds", "MCP call duration.", ["server", "tool"], buckets=_BUCKETS, registry=REGISTRY)
 
 ASK_OUTCOMES = {"answered", "fallback", "refused", "cached", "rate_limited", "disabled", "budget", "error"}

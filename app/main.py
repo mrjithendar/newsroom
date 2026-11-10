@@ -45,6 +45,7 @@ from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
 from .news.store import MemoryNewsStore, PgNewsStore
 from .runs import FlowRunner, MemoryFlowPersistence, MemoryLocks, MemoryRunStore, PgAdvisoryLocks, PgFlowPersistence, PgRunStore, RunError, view
 from .schemas import AskRequest
+from .seo_ml.store import MemoryMlStore, PgMlStore
 from .services import review
 from .services.ask_pipeline import AskPipeline
 from .services.content import ContentError
@@ -103,6 +104,18 @@ def _crews(deps: Deps) -> None:
     deps.report_crew = deps.report_crew or (lambda: ReportCrew(s, llm, web, ret))
 
 
+def _ml(deps: Deps, store: Any, embeddings: Any) -> None:
+    """v5 SEO-side ML (app/flows/ml.py). Queries are embedded as documents (no query prefix): they are clustered and
+    classified against each other, not retrieved against passages."""
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        return await embeddings.embed(texts)
+
+    deps.extra.setdefault("ml_store", store)
+    deps.extra.setdefault("ml_embed", embed)
+    deps.extra.setdefault("ml_embed_model", getattr(embeddings, "name", "unknown"))
+
+
 def _news(deps: Deps, store: Any, embeddings: Any) -> None:
     """News desk dependencies (app/flows/news.py). Tests may pre-set any of these in deps.extra."""
 
@@ -138,6 +151,7 @@ async def build_container(settings: Settings) -> Container:
     deps = Deps(settings=settings, llm=llm, web=web, retriever=index, store=store)
     _crews(deps)
     _news(deps, PgNewsStore(pool), index.emb)
+    _ml(deps, PgMlStore(pool), index.emb)
     runner = FlowRunner(SPECS, store, PgAdvisoryLocks(settings.database_url), lambda: PgFlowPersistence().bind(sync_pool), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s)
@@ -157,6 +171,7 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     deps = Deps(settings=settings, llm=llm, web=web, retriever=retriever, store=store, sleep=no_sleep, verify_delays=verify_delays, **crews)
     _crews(deps)
     _news(deps, MemoryNewsStore(), HashEmbeddings())
+    _ml(deps, MemoryMlStore(), HashEmbeddings())
     runner = FlowRunner(SPECS, store, MemoryLocks(), lambda: MemoryFlowPersistence().bind(store), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))
@@ -195,6 +210,28 @@ async def _news_gauges(conn: Any) -> None:
         pass
 
 
+async def _ml_gauges(conn: Any) -> None:
+    """seo_ml_flow failures in a row (restart-safe, from seo_flow_runs) and which models are active (seo_ml_models)."""
+    try:
+        cur = await conn.execute("select status from seo_flow_runs where flow_name = 'seo_ml_flow' and status in ('succeeded', 'failed') order by started_at desc limit 5")
+        n = 0
+        for r in await cur.fetchall():
+            if r["status"] != "failed":
+                break
+            n += 1
+        metrics.ML_FLOW_CONSECUTIVE_FAILURES.set(n)
+        cur = await conn.execute("select kind from seo_ml_models where active")
+        active = {r["kind"] for r in await cur.fetchall()}
+        for k in metrics.ML_MODELS:
+            metrics.ML_MODEL_ACTIVE.labels(model=k).set(1 if k in active else 0)
+        cur = await conn.execute("select (metrics ->> 'recall@3')::float8 as r from seo_rag_eval_runs where config = 'live' order by at desc limit 1")
+        row = await cur.fetchone()
+        if row and row["r"] is not None:
+            metrics.RAG_EVAL_RECALL3.set(float(row["r"]))
+    except Exception:  # noqa: S110 - migration 0019 may not be applied yet
+        pass
+
+
 async def _gauges(c: Container) -> None:
     while True:
         try:
@@ -211,6 +248,7 @@ async def _gauges(c: Container) -> None:
                     for r in await cur.fetchall():
                         metrics.LAST_SUCCESS.labels(flow=metrics.flow_label(r["flow_name"])).set(float(r["t"] or 0))
                     await _news_gauges(conn)
+                    await _ml_gauges(conn)
             if isinstance(c.ask.log, PgAskLog):
                 await c.ask.log.prune(c.settings.ask_retention_days)
         except Exception:  # noqa: S110 - gauges are best effort
@@ -219,6 +257,9 @@ async def _gauges(c: Container) -> None:
 
 
 async def startup(c: Container) -> None:
+    mode = getattr(getattr(c.index, "config", None), "mode", "vector")
+    for m in metrics.RAG_MODES:
+        metrics.RAG_RETRIEVAL_MODE.labels(mode=m).set(1 if m == mode else 0)
     try:
         await c.runner.recover()
     except Exception as e:  # e.g. the web app's migration 0016 not applied yet: start, report on /readyz

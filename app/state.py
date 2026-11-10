@@ -84,6 +84,13 @@ class ReindexInput(_In):
     force: bool = False  # skip the index safety guard (IndexSafetyError) after checking the article list
 
 
+class MlInput(_In):
+    # empty = every model; else a subset of decay, query_clusters, intent, priority, related, rag_eval
+    models: list[Literal["decay", "query_clusters", "intent", "priority", "related", "rag_eval"]] = Field(default_factory=list, max_length=6)
+    suggest_labels: bool = False  # ask Claude to suggest groupings for the 200-query labelling sample (once)
+    slot: str | None = Field(default=None, max_length=40, pattern=r"^[0-9A-Za-z:_-]+$")
+
+
 class ReportInput(_In):
     period: Literal["weekly", "monthly"] = "weekly"
 
@@ -173,3 +180,10 @@ class ReportState(RunState):
     crew: dict[str, Any] = Field(default_factory=dict)
     pdf: dict[str, Any] = Field(default_factory=dict)
     notified: dict[str, Any] = Field(default_factory=dict)
+
+
+class MlState(RunState):
+    models: list[str] = Field(default_factory=list)
+    suggest_labels: bool = False
+    slot: str | None = None
+    results: dict[str, Any] = Field(default_factory=dict)

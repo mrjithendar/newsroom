@@ -1,0 +1,8 @@
+{
+  "image": "seo-agent:ci (linux/amd64, the pull request build in ci-seo-agent.yml)",
+  "uncompressed_bytes": null,
+  "compressed_bytes": null,
+  "measured": null,
+  "commit": null,
+  "note": "Not measured yet: no container runtime on the development machine. Filled from the first CI run of feature/seo-v5-ml-rag (scripts/image-size.sh prints both numbers)."
+}
