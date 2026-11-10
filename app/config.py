@@ -9,15 +9,17 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-# Third-party telemetry off before crewai is imported anywhere (it reads these at import/first use). OTEL_SDK_DISABLED
-# is deliberately NOT set: it would also switch off this service's own OpenTelemetry tracing to the cluster collector.
+# Third-party telemetry off before crewai is imported anywhere (crewai_core 1.15.30 reads these at import/first use).
+# OTEL_SDK_DISABLED is deliberately NOT set: it would also switch off this service's own OpenTelemetry tracing.
+# CREWAI_STORAGE_DIR points CrewAI's local storage at an emptyDir: nothing may write SQLite there (the flows use the
+# Postgres persistence, app/runs.py, and a test asserts no .db file appears), but if a code path ever tried, it must
+# not land in the read-only image.
 for _k, _v in {
     "CREWAI_DISABLE_TELEMETRY": "true",
     "CREWAI_DISABLE_TRACKING": "true",
     "CREWAI_TRACING_ENABLED": "false",
     "CREWAI_DISABLE_VERSION_CHECK": "true",
-    "LANGSMITH_TRACING": "false",
-    "LANGCHAIN_TRACING_V2": "false",
+    "CREWAI_STORAGE_DIR": "/tmp/crewai",  # noqa: S108 - emptyDir in the pod
 }.items():
     os.environ.setdefault(_k, _v)
 
@@ -26,7 +28,6 @@ DEFAULT_DOCS_ALLOWLIST = (
     "docs.aws.amazon.com",
     "developer.hashicorp.com",
     "docs.python.org",
-    "langchain-ai.github.io",
     "docs.crewai.com",
     "modelcontextprotocol.io",
 )
@@ -74,6 +75,9 @@ class Settings:
     crew_max_tokens_per_run: int = 150_000  # ≈ a normal 4-agent run is ~80k (docs/seo/COSTS.md)
     crew_timeout_s: int = 600
     crew_max_iter: int = 4
+    crew_max_rpm: int = 20
+    # Per-agent model overrides, "<crew>.<agent>" → model, e.g. {"optimization.analyst": "claude-haiku-5-5"}.
+    crew_models: dict[str, str] = field(default_factory=dict)
     fanout_concurrency: int = 2
     weekly_max_articles: int = 10
     embeddings_provider: str = "onnx"
@@ -89,6 +93,36 @@ class Settings:
     production: bool = False
     otel_endpoint: str = ""
     service_name: str = "seo-agent"
+    # v4: MCP (docs/seo/MCP.md). Both servers are off until switched on; the admin one only after OAuth is verified.
+    site_url: str = "https://jithendar.com"
+    public_mcp_enabled: bool = False
+    admin_mcp_enabled: bool = False
+    edge_port: int = 8090  # MCP listener (Kong → here only); the internal API stays on PORT (8080)
+    mcp_allowed_hosts: tuple[str, ...] = ("jithendar.com", "www.jithendar.com")
+    public_mcp_rpm_per_ip: int = 30
+    public_mcp_daily_calls: int = 5000
+    admin_mcp_rpm_per_token: int = 120
+    admin_kickoffs_per_hour: int = 10
+    flow_timeout_s: int = 1800  # wall clock per flow run (crews have their own, shorter limit)
+
+    @property
+    def admin_mcp_resource(self) -> str:
+        """RFC 8707 resource indicator / token audience of the admin MCP server."""
+        return f"{self.site_url.rstrip('/')}/mcp/admin"
+
+
+def _models(raw: str) -> dict[str, str]:
+    """SEO_CREW_MODELS: JSON object of "<crew>.<agent>" → Claude model id; anything malformed is ignored."""
+    import json
+    import re
+
+    try:
+        v = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return {}
+    if not isinstance(v, dict):
+        return {}
+    return {k: m for k, m in v.items() if isinstance(k, str) and isinstance(m, str) and re.fullmatch(r"[a-z_]+\.[a-z_]+", k) and re.fullmatch(r"claude-[a-z0-9-]{3,40}", m)}
 
 
 def load_settings() -> Settings:
@@ -108,6 +142,8 @@ def load_settings() -> Settings:
         crew_max_tokens_per_run=_int("CREW_MAX_TOKENS_PER_RUN", Settings.crew_max_tokens_per_run),
         crew_timeout_s=_int("CREW_TIMEOUT_SECONDS", Settings.crew_timeout_s),
         crew_max_iter=_int("CREW_MAX_ITER", Settings.crew_max_iter),
+        crew_max_rpm=max(1, _int("CREW_MAX_RPM", Settings.crew_max_rpm)),
+        crew_models=_models(env.get("SEO_CREW_MODELS", "")),
         fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency)),
         weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles),
         embeddings_provider=env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx",
@@ -123,4 +159,14 @@ def load_settings() -> Settings:
         production=env.get("APP_ENV", "") == "production",
         otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
         service_name=env.get("OTEL_SERVICE_NAME", "seo-agent"),
+        site_url=(env.get("SITE_URL", "").strip() or Settings.site_url).rstrip("/"),
+        public_mcp_enabled=_bool("PUBLIC_MCP_ENABLED", False),
+        admin_mcp_enabled=_bool("ADMIN_MCP_ENABLED", False),
+        edge_port=_int("SEO_AGENT_EDGE_PORT", Settings.edge_port),
+        mcp_allowed_hosts=tuple(h.strip().lower() for h in env.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()) or Settings.mcp_allowed_hosts,
+        public_mcp_rpm_per_ip=max(1, _int("PUBLIC_MCP_RPM_PER_IP", Settings.public_mcp_rpm_per_ip)),
+        public_mcp_daily_calls=_int("PUBLIC_MCP_DAILY_CALLS", Settings.public_mcp_daily_calls),
+        admin_mcp_rpm_per_token=max(1, _int("ADMIN_MCP_RPM_PER_TOKEN", Settings.admin_mcp_rpm_per_token)),
+        admin_kickoffs_per_hour=max(1, _int("ADMIN_MCP_KICKOFFS_PER_HOUR", Settings.admin_kickoffs_per_hour)),
+        flow_timeout_s=max(60, _int("SEO_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s)),
     )

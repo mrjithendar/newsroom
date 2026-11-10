@@ -32,7 +32,7 @@ async def test_every_client_call_hits_a_server_route() -> None:
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append((req.method, req.url.path, req.headers.get("authorization")))
-        return httpx.Response(200, json={"articles": [], "queries": [], "items": []})
+        return httpx.Response(200, json={"articles": [], "queries": [], "items": [], "articleIds": [], "topics": []})
 
     web = HttpWebApp("http://web:9465", "c" * 40, transport=httpx.MockTransport(handler))
     await web.article_context(UUID, {})
@@ -49,7 +49,25 @@ async def test_every_client_call_hits_a_server_route() -> None:
     await web.weekly_candidates(5)
     await web.plan_links(UUID, [])
     await web.calendar_brief(UUID)
+    # v4
+    await web.run_job("gsc_sync", "2026-11-10", "schedule")
+    await web.draft_summary(UUID)
+    await web.reject_draft(UUID, "r", "admin")
+    await web.add_review_note(UUID, "n", "admin")
+    await web.review_queue({"sort": "priority"})
+    await web.draft_diff(UUID)
+    await web.open_draft_articles(10)
+    for name in ("overview", "traffic-change", "keywords", "page-report", "audit-issues", "llm-usage"):
+        await web.data(name, {})
+    await web.topics()
+    await web.report_generate("weekly")
+    await web.report_narrative(UUID, "text", {"ok": True})
+    await web.report_notify(UUID)
+    await web.report_pdf(UUID, b"%PDF-1.4")
+    await web.cluster_ask_gaps()
     await web.close()
+    called = {m for m in dir(HttpWebApp) if not m.startswith("_") and m != "close"}
+    assert len(seen) >= len(called), "a client method is not exercised by this contract test"
     table = routes()
     for method, path, auth in seen:
         assert path.startswith("/internal/seo-agent/"), path

@@ -1,4 +1,5 @@
-# seo-agent (docs/seo/AGENTS.md). Multi-stage, non-root, CPU-only: no torch, no CUDA; ONNX Runtime runs the embeddings.
+# seo-agent (docs/seo/FLOWS.md, MCP.md). Multi-stage, non-root, CPU-only: no torch, no CUDA; ONNX Runtime runs the
+# embeddings; ReportLab (pure Python) renders the report PDFs, so no system libraries are added.
 # The embeddings model (BAAI/bge-small-en-v1.5, ONNX export, MIT) is baked in at a pinned revision and verified by
 # sha256, so pods never download anything at start-up and the image is reproducible.
 ARG PYTHON_VERSION=3.13
@@ -30,7 +31,8 @@ ENV PATH=/srv/.venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     EMBEDDINGS_MODEL_DIR=/models/bge-small-en-v1.5 \
     TOKENIZERS_PARALLELISM=false RAYON_NUM_THREADS=1 OMP_NUM_THREADS=2 MALLOC_ARENA_MAX=2 \
     CREWAI_DISABLE_TELEMETRY=true CREWAI_DISABLE_TRACKING=true CREWAI_TRACING_ENABLED=false CREWAI_DISABLE_VERSION_CHECK=true \
-    LANGSMITH_TRACING=false LANGCHAIN_TRACING_V2=false
+    CREWAI_STORAGE_DIR=/tmp/crewai
 USER 10001:10001
-EXPOSE 8080
+# 8080 internal API (web app, trigger CronJobs, Prometheus) · 8090 MCP edge (Kong only)
+EXPOSE 8080 8090
 CMD ["python", "-m", "app.main"]

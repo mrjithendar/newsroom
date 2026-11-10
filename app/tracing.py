@@ -1,6 +1,7 @@
 """OpenTelemetry tracing to the cluster's existing collector (OTLP/HTTP, OTEL_EXPORTER_OTLP_ENDPOINT, e.g.
-http://otel-collector.observability:4318 → Jaeger, like the web app). One span per graph node and per crew task.
-No endpoint → spans are created but not exported. LangSmith and CrewAI's own tracing stay off (config.py)."""
+http://otel-collector.observability:4318 → Jaeger, like the web app). One span per flow step (flow.<flow>.<step>) and
+per crew run (crew.<name>). No endpoint → spans are created but not exported. CrewAI's own tracing and telemetry stay
+off (config.py)."""
 
 from __future__ import annotations
 

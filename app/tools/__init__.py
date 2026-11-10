@@ -1,8 +1,8 @@
 """Agent tools: read-only, allowlisted.
 
-ALLOWED_TOOLS is the complete list an agent or crew member can ever hold. There is no shell, no arbitrary HTTP and
-no database write among them: the one write in the system ("create/update draft") is done by graph nodes through the
-web app's draft API, never by an agent. `build_tools` refuses any name outside the allowlist, and a test asserts the
+ALLOWED_TOOLS is the complete list an agent or crew member can ever hold. There is no shell, no arbitrary HTTP, no
+code execution and no database write among them: the one write in the system ("create/update draft") is done by flow
+steps through the web app's draft API, never by an agent. `build_tools` refuses any name outside the allowlist, and a test asserts the
 crew's agents hold exactly these.
 """
 
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-ALLOWED_TOOLS = frozenset({"read_article", "vector_search", "gsc_queries_for_topic", "fetch_allowlisted_docs"})
+ALLOWED_TOOLS = frozenset({"read_article", "vector_search", "gsc_queries_for_topic", "gsc_queries_for_page", "style_guide", "fetch_allowlisted_docs"})
 
 EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
@@ -100,15 +100,22 @@ def build_tools(names: list[str], ctx: ToolContext) -> list[ToolSpec]:
         "read_article": ToolSpec("read_article", "Read one of this site's articles by path (/blog/slug) or id. Input: the path or id.", ctx.read_article),
         "vector_search": ToolSpec("vector_search", "Search this site's articles by meaning. Input: a short query. Returns titles, paths, sections and excerpts.", ctx.vector_search),
         "gsc_queries_for_topic": ToolSpec("gsc_queries_for_topic", "Search Console queries (28 days, aggregated) that contain the topic words. Input: a topic.", ctx.gsc_queries_for_topic),
+        "gsc_queries_for_page": ToolSpec("gsc_queries_for_page", "Search Console queries (28 days, aggregated: clicks, impressions, CTR, position) the article being optimised ranks for. Input: anything (the article is fixed).", ctx.gsc_queries_for_page),
+        "style_guide": ToolSpec("style_guide", "The site's writing style guide. Input: anything.", ctx.style_guide),
         "fetch_allowlisted_docs": ToolSpec("fetch_allowlisted_docs", "Fetch an official documentation page (https, allowlisted domains only). Input: the URL.", ctx.fetch_allowlisted_docs),
     }
     return [registry[n] for n in names]
 
 
 class ToolContext:
-    """Implements the four tools on top of the web app callback API and the retriever. All results are data blocks."""
+    """Implements the tools on top of the web app callback API and the retriever. All results are data blocks.
 
-    def __init__(self, web: Any, retriever: Any, docs_allowlist: tuple[str, ...], on_source: Callable[[str, str], None] | None = None):
+    `article_id` fixes gsc_queries_for_page to the article being optimised (an agent cannot ask about another page);
+    `style` is the style guide text the web app sent with the article context or brief."""
+
+    def __init__(self, web: Any, retriever: Any, docs_allowlist: tuple[str, ...], on_source: Callable[[str, str], None] | None = None, *, article_id: str | None = None, style: str = ""):
+        self.article_id = article_id
+        self.style = style
         self.web = web
         self.retriever = retriever
         self.docs_allowlist = docs_allowlist
@@ -122,14 +129,31 @@ class ToolContext:
 
     async def vector_search(self, query: str) -> str:
         self.calls.append(("vector_search", query))
-        hits = await self.retriever.search(query.strip()[:500], k=6)
-        return data_block("search_results", [{"title": h.title, "path": h.path, "section": h.heading_path, "anchor": h.anchor, "excerpt": h.content[:800], "score": round(h.score, 3)} for h in hits])
+        from ..services.content import ContentError, search
+
+        try:
+            rows = await search(self.retriever, query, limit=6)  # the same function the public MCP search uses
+        except ContentError as e:
+            return data_block("search_refused", {"reason": str(e)})
+        return data_block("search_results", [{"title": r["title"], "path": r["path"], "section": r["section"], "anchor": r["anchor"], "excerpt": r["snippet"], "score": r["score"]} for r in rows])
 
     async def gsc_queries_for_topic(self, topic: str) -> str:
         self.calls.append(("gsc_queries_for_topic", topic))
         rows = await self.web.gsc_queries(topic=topic.strip()[:120], limit=25)
         keep = set(safe_queries([r["query"] for r in rows]))
         return data_block("search_console_queries_28d", [r for r in rows if r["query"] in keep])
+
+    async def gsc_queries_for_page(self, _input: str) -> str:
+        self.calls.append(("gsc_queries_for_page", self.article_id or ""))
+        if not self.article_id:
+            return data_block("search_console_queries_28d", [])
+        rows = await self.web.gsc_queries(article_id=self.article_id, limit=25)
+        keep = set(safe_queries([r["query"] for r in rows]))
+        return data_block("search_console_queries_28d", [r for r in rows if r["query"] in keep])
+
+    async def style_guide(self, _input: str) -> str:
+        self.calls.append(("style_guide", ""))
+        return data_block("style_guide", self.style[:12_000])
 
     async def fetch_allowlisted_docs(self, url: str) -> str:
         self.calls.append(("fetch_allowlisted_docs", url))
