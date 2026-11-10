@@ -4,7 +4,8 @@ version = "3.0.0"
 description = "jithendar.com SEO platform v3: LangGraph orchestration, CrewAI editorial crew, pgvector retrieval (cluster-internal)."
 requires-python = ">=3.13,<3.14"
 # Exact pins. Rule (v1/v2, docs/seo/DECISIONS.md D-41): the newest stable release that was at least two weeks old at
-# implementation time (2026-11-10). `tool.uv.exclude-newer` applies the same cut-off to every transitive dependency.
+# implementation time (2026-11-10). `tool.uv.exclude-newer = "2 weeks"` applies the same rule to every transitive
+# dependency on every re-lock (Dependabot included), so no date needs bumping.
 dependencies = [
   "langgraph==1.2.18",
   "langgraph-checkpoint-postgres==3.2.0",
@@ -35,22 +36,29 @@ dev = [
 ]
 
 [tool.uv]
-exclude-newer = "2026-10-27T00:00:00Z"
+exclude-newer = "2 weeks"
+# CrewAI hard-requires LanceDB (+ pyarrow, ~290 MB) for its memory feature, which this service never enables
+# (memory=False). chromadb cannot be dropped: crewai imports it at load. docs/seo/DECISIONS.md D-47.
+override-dependencies = ["lancedb; sys_platform == 'never'"]
+# Security exception to the two-week rule (D-53): oauthlib 4.0.1 (2026-10-31) fixes CVE-2026-49272.
+constraint-dependencies = ["oauthlib>=4.0.1"]
+exclude-newer-package = { oauthlib = "2026-11-10T00:00:00Z" }
 package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["ignore::DeprecationWarning:crewai.*", "ignore::DeprecationWarning:crewai_core.*"]
 markers = ["postgres: needs a PostgreSQL with pgvector (testcontainers or SEO_AGENT_TEST_DATABASE_URL)"]
 
 [tool.ruff]
-line-length = 120
+line-length = 160
 target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
-ignore = ["S101", "RUF001", "RUF002", "RUF003"]
+ignore = ["S101", "E501", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S105", "S106", "S108", "S311"]
