@@ -76,6 +76,8 @@ class Settings:
     crew_timeout_s: int = 600
     crew_max_iter: int = 4
     crew_max_rpm: int = 20
+    # Per-agent model overrides, "<crew>.<agent>" → model, e.g. {"optimization.analyst": "claude-haiku-5-5"}.
+    crew_models: dict[str, str] = field(default_factory=dict)
     fanout_concurrency: int = 2
     weekly_max_articles: int = 10
     embeddings_provider: str = "onnx"
@@ -109,6 +111,20 @@ class Settings:
         return f"{self.site_url.rstrip('/')}/mcp/admin"
 
 
+def _models(raw: str) -> dict[str, str]:
+    """SEO_CREW_MODELS: JSON object of "<crew>.<agent>" → Claude model id; anything malformed is ignored."""
+    import json
+    import re
+
+    try:
+        v = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return {}
+    if not isinstance(v, dict):
+        return {}
+    return {k: m for k, m in v.items() if isinstance(k, str) and isinstance(m, str) and re.fullmatch(r"[a-z_]+\.[a-z_]+", k) and re.fullmatch(r"claude-[a-z0-9-]{3,40}", m)}
+
+
 def load_settings() -> Settings:
     env = os.environ
     docs = tuple(h.strip().lower() for h in env.get("SEO_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
@@ -127,6 +143,7 @@ def load_settings() -> Settings:
         crew_timeout_s=_int("CREW_TIMEOUT_SECONDS", Settings.crew_timeout_s),
         crew_max_iter=_int("CREW_MAX_ITER", Settings.crew_max_iter),
         crew_max_rpm=max(1, _int("CREW_MAX_RPM", Settings.crew_max_rpm)),
+        crew_models=_models(env.get("SEO_CREW_MODELS", "")),
         fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency)),
         weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles),
         embeddings_provider=env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx",

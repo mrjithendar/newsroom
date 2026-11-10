@@ -150,7 +150,7 @@ class AgentDef:
     tools: list[str]
 
 
-def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: asyncio.AbstractEventLoop, run: CrewRun, tools_ctx: ToolContext, *, draft_id: str | None, purpose: str, prompt_version: str, models: dict[str, str] | None = None, default_model: str | None = None) -> dict[str, Any]:
+def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: asyncio.AbstractEventLoop, run: CrewRun, tools_ctx: ToolContext, *, draft_id: str | None, purpose: str, prompt_version: str, crew: str, models: dict[str, str] | None = None, default_model: str | None = None) -> dict[str, Any]:
     from crewai import Agent
 
     LLMClass, ToolClass = llm_class(), tool_class()
@@ -158,7 +158,8 @@ def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: async
     for d in defs:
         specs = build_tools(d.tools, tools_ctx)  # refuses anything outside the allowlist
         tools = [ToolClass(name=s.name, description=s.description).bind(s, loop) for s in specs]
-        model = (models or {}).get(d.key) or default_model or settings.draft_model
+        # Per-agent model: a per-run override (brief.models), then SEO_CREW_MODELS "<crew>.<agent>", then the crew default.
+        model = (models or {}).get(d.key) or settings.crew_models.get(f"{crew}.{d.key}") or default_model or settings.draft_model
         agent_llm = LLMClass(model=model, max_tokens=4096).bind(llm, loop, run, draft_id, purpose, prompt_version)
         out[d.key] = Agent(
             role=d.role,
