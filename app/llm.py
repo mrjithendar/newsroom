@@ -1,11 +1,11 @@
-"""Claude access for every graph node and the crew: model factory, budget guard, usage logging.
+"""Claude access for every flow step and crew: Anthropic SDK client, budget guard, usage logging.
 
-- One admin budget for v2 and v3: usage rows go to the web app's `seo_llm_usage` table (same columns, same prices), so
+- One admin budget for v2 and v4: usage rows go to the web app's `seo_llm_usage` table (same columns, same prices), so
   SEO_LLM_MONTHLY_BUDGET_USD caps the legacy path and the agents together. Ask-the-Blog is separate: its rows (purpose
   "ask…") never count against the admin budget, and it has its own daily cap (ASK_BLOG_DAILY_BUDGET_USD), which also
   bounds its month (≤ 31 × daily).
 - Before every call an upper-bound estimate (characters / 3.5 in, full max_tokens out) is checked; a call that could
-  cross the cap is never sent (BudgetExceeded → the graph moves to paused_budget).
+  cross the cap is never sent (BudgetExceeded → the flow run moves to paused_budget).
 - Stable system text (rules, style guide) is sent as cached system blocks (cache_control ephemeral).
 - Tests inject FakeLlm: deterministic structured answers per purpose, with fake token counts.
 """
@@ -219,6 +219,7 @@ class CallSpec:
     user: str
     max_tokens: int = 4096
     draft_id: str | None = None
+    effort: str | None = None  # output_config.effort; None = the model's default
 
     @property
     def input_chars(self) -> int:
@@ -239,82 +240,105 @@ def _system_blocks(cached: list[str]) -> list[dict[str, Any]]:
 
 
 def _usage_from(msg: Any, model: str, started: float) -> Usage:
-    um = getattr(msg, "usage_metadata", None) or {}
-    details = um.get("input_token_details") or {}
-    cache_read = int(details.get("cache_read") or 0)
-    cache_write = int(details.get("cache_creation") or 0)
-    # LangChain's input_tokens includes cached tokens; bill the uncached part at the input rate.
-    inp = max(0, int(um.get("input_tokens") or 0) - cache_read - cache_write)
-    meta = getattr(msg, "response_metadata", None) or {}
+    """Anthropic usage: input_tokens is already the uncached part; cache reads/writes are reported separately."""
+    u = getattr(msg, "usage", None)
     return Usage(
         model=model,
-        input_tokens=inp,
-        output_tokens=int(um.get("output_tokens") or 0),
-        cache_read_tokens=cache_read,
-        cache_write_tokens=cache_write,
-        request_id=meta.get("id"),
+        input_tokens=int(getattr(u, "input_tokens", 0) or 0),
+        output_tokens=int(getattr(u, "output_tokens", 0) or 0),
+        cache_read_tokens=int(getattr(u, "cache_read_input_tokens", 0) or 0),
+        cache_write_tokens=int(getattr(u, "cache_creation_input_tokens", 0) or 0),
+        request_id=getattr(msg, "_request_id", None) or getattr(msg, "id", None),
         latency_ms=int((time.monotonic() - started) * 1000),
     )
 
 
+# Server-side refusal fallback (routes a declined request to a model the API picks by refusal category). Only the
+# models that accept the "default" form get it; Haiku has no server-side fallback.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
+FALLBACK_MODELS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1")
+
+
+def _text_of(msg: Any) -> str:
+    return "".join(getattr(b, "text", "") for b in (getattr(msg, "content", None) or []) if getattr(b, "type", "") == "text")
+
+
+class Refused(Exception):
+    """stop_reason == "refusal" (after any server-side fallback)."""
+
+
 class AnthropicLlm:
-    """ChatAnthropic (langchain-anthropic) behind the budget guard. Retries: the SDK's own (2), nodes add backoff."""
+    """The official Anthropic SDK (AsyncAnthropic) behind the budget guard. No LangChain (D-54).
 
-    def __init__(self, api_key: str, guard: BudgetGuard, timeout_s: float = 120):
-        self.api_key = api_key
+    - Structured output: `messages.parse(output_format=<Pydantic model>)` (output_config.format under the hood), then
+      the caller validates again server-side (the web app's validators).
+    - Stable system text is sent as cached system blocks; usage rows record cache reads/writes.
+    - The SDK retries connection errors, 408/409/429/5xx twice; flows add nothing on top except their one
+      validation retry.
+    """
+
+    def __init__(self, api_key: str, guard: BudgetGuard, timeout_s: float = 120, client: Any = None):
         self.guard = guard
-        self.timeout_s = timeout_s
+        if client is None:
+            import anthropic
 
-    def chat(self, model: str, max_tokens: int, streaming: bool = False) -> Any:
-        from langchain_anthropic import ChatAnthropic
+            client = anthropic.AsyncAnthropic(api_key=api_key or None, timeout=timeout_s, max_retries=2)
+        self.client = client
 
-        return ChatAnthropic(
-            model=model,
-            api_key=self.api_key,
-            max_tokens=max_tokens,
-            timeout=self.timeout_s,
-            max_retries=2,
-            streaming=streaming,
-            stream_usage=True,
-        )
+    def _kw(self, spec: CallSpec) -> dict[str, Any]:
+        kw: dict[str, Any] = {"model": spec.model, "max_tokens": spec.max_tokens, "system": _system_blocks(spec.cached_system), "messages": [{"role": "user", "content": spec.user}]}
+        if spec.model in FALLBACK_MODELS:
+            kw.update(betas=[FALLBACK_BETA], fallbacks="default")
+        if spec.effort:
+            kw["output_config"] = {"effort": spec.effort}
+        return kw
 
-    def _messages(self, spec: CallSpec) -> list[Any]:
-        from langchain_core.messages import HumanMessage, SystemMessage
+    def _api(self, spec: CallSpec) -> Any:
+        return self.client.beta.messages if spec.model in FALLBACK_MODELS else self.client.messages
 
-        return [SystemMessage(content=_system_blocks(spec.cached_system)), HumanMessage(content=spec.user)]  # type: ignore[arg-type]
+    async def _check(self, msg: Any, spec: CallSpec, usage: Usage) -> None:
+        if getattr(msg, "stop_reason", None) == "refusal":
+            await self.guard.record(usage, spec.purpose, spec.prompt_version, "refused", "refusal", spec.draft_id)
+            raise Refused("the model declined this request")
 
     async def structured(self, spec: CallSpec, schema: type[T]) -> tuple[T, Usage]:
         await self.guard.ensure(spec.model, spec.input_chars, spec.max_tokens, spec.purpose)
         started = time.monotonic()
-        runnable = self.chat(spec.model, spec.max_tokens).with_structured_output(schema, include_raw=True)
-        out = await runnable.ainvoke(self._messages(spec))
-        usage = _usage_from(out["raw"], spec.model, started)
-        parsed = out.get("parsed")
-        if parsed is None or out.get("parsing_error") is not None:
+        try:
+            msg = await self._api(spec).parse(**self._kw(spec), output_format=schema)
+        except Exception as e:
+            if type(e).__name__ == "ValidationError":  # the SDK could not parse the model's JSON into the schema
+                raise InvalidOutput(str(e)[:500]) from e
+            raise
+        usage = _usage_from(msg, spec.model, started)
+        await self._check(msg, spec, usage)
+        parsed = getattr(msg, "parsed_output", None)
+        if parsed is None:
             await self.guard.record(usage, spec.purpose, spec.prompt_version, "invalid", "schema", spec.draft_id)
-            raise InvalidOutput(str(out.get("parsing_error") or "no structured output"), usage)
+            raise InvalidOutput(f"no structured output (stop_reason={getattr(msg, 'stop_reason', None)})", usage)
         await self.guard.record(usage, spec.purpose, spec.prompt_version, draft_id=spec.draft_id)
         return parsed, usage
 
     async def text(self, spec: CallSpec) -> tuple[str, Usage]:
         await self.guard.ensure(spec.model, spec.input_chars, spec.max_tokens, spec.purpose)
         started = time.monotonic()
-        msg = await self.chat(spec.model, spec.max_tokens).ainvoke(self._messages(spec))
+        msg = await self._api(spec).create(**self._kw(spec))
         usage = _usage_from(msg, spec.model, started)
+        await self._check(msg, spec, usage)
         await self.guard.record(usage, spec.purpose, spec.prompt_version, draft_id=spec.draft_id)
-        return str(msg.content if isinstance(msg.content, str) else "".join(b.get("text", "") for b in msg.content if isinstance(b, dict))), usage
+        return _text_of(msg), usage
 
     async def stream(self, spec: CallSpec) -> AsyncIterator[str]:
         await self.guard.ensure(spec.model, spec.input_chars, spec.max_tokens, spec.purpose)
         started = time.monotonic()
-        last = None
-        async for chunk in self.chat(spec.model, spec.max_tokens, streaming=True).astream(self._messages(spec)):
-            last = chunk if last is None else last + chunk
-            text = chunk.content if isinstance(chunk.content, str) else "".join(b.get("text", "") for b in chunk.content if isinstance(b, dict))
-            if text:
-                yield text
-        if last is not None:
-            await self.guard.record(_usage_from(last, spec.model, started), spec.purpose, spec.prompt_version)
+        async with self._api(spec).stream(**self._kw(spec)) as s:
+            async for text in s.text_stream:
+                if text:
+                    yield text
+            msg = await s.get_final_message()
+        usage = _usage_from(msg, spec.model, started)
+        await self._check(msg, spec, usage)
+        await self.guard.record(usage, spec.purpose, spec.prompt_version)
 
 
 class InvalidOutput(Exception):

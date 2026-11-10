@@ -1,18 +1,19 @@
 [project]
 name = "seo-agent"
-version = "3.0.0"
-description = "jithendar.com SEO platform v3: LangGraph orchestration, CrewAI editorial crew, pgvector retrieval (cluster-internal)."
+version = "4.0.0"
+description = "jithendar.com SEO platform v4: CrewAI Flows + Crews as the only agent and job engine, MCP servers, pgvector retrieval."
 requires-python = ">=3.13,<3.14"
 # Exact pins. Rule (v1/v2, docs/seo/DECISIONS.md D-41): the newest stable release that was at least two weeks old at
 # implementation time (2026-11-10). `tool.uv.exclude-newer = "2 weeks"` applies the same rule to every transitive
 # dependency on every re-lock (Dependabot included), so no date needs bumping.
 dependencies = [
-  "langgraph==1.2.18",
-  "langgraph-checkpoint-postgres==3.2.0",
-  "langchain-core==1.7.0",
-  "langchain-anthropic==1.7.6",
-  "langchain-text-splitters==1.1.3",
   "crewai==1.15.30",
+  # Official SDKs, pinned directly (D-54): Claude through the Anthropic SDK behind CrewAI's BaseLLM; MCP servers through
+  # the official MCP SDK. crewai requires mcp<2, so 1.30.0 (the newest 1.x) rather than 2.3.0.
+  "anthropic==2.3.0",
+  "mcp==1.30.0",
+  # Report PDFs (D-61): pure Python, no system libraries, CPU-only image stays slim.
+  "reportlab==5.1.0",
   "fastapi==0.162.0",
   "uvicorn==0.54.0",
   "psycopg[binary]==3.3.6",
