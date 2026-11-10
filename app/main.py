@@ -37,10 +37,12 @@ from .config import Settings, load_settings
 from .crews.editorial import EditorialCrew
 from .crews.optimization import OptimizationCrew
 from .crews.report import ReportCrew
+from .embeddings import HashEmbeddings
 from .flows import SPECS, check_kickoff
 from .flows.base import Deps
 from .index import MemoryRetriever, PgVectorIndex
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
+from .news.store import MemoryNewsStore, PgNewsStore
 from .runs import FlowRunner, MemoryFlowPersistence, MemoryLocks, MemoryRunStore, PgAdvisoryLocks, PgFlowPersistence, PgRunStore, RunError, view
 from .schemas import AskRequest
 from .services import review
@@ -101,6 +103,16 @@ def _crews(deps: Deps) -> None:
     deps.report_crew = deps.report_crew or (lambda: ReportCrew(s, llm, web, ret))
 
 
+def _news(deps: Deps, store: Any, embeddings: Any) -> None:
+    """News desk dependencies (app/flows/news.py). Tests may pre-set any of these in deps.extra."""
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        return await embeddings.embed(texts)
+
+    deps.extra.setdefault("news_store", store)
+    deps.extra.setdefault("news_embed", embed)
+
+
 async def build_container(settings: Settings) -> Container:
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool, ConnectionPool
@@ -125,6 +137,7 @@ async def build_container(settings: Settings) -> Container:
     store = PgRunStore(pool)
     deps = Deps(settings=settings, llm=llm, web=web, retriever=index, store=store)
     _crews(deps)
+    _news(deps, PgNewsStore(pool), index.emb)
     runner = FlowRunner(SPECS, store, PgAdvisoryLocks(settings.database_url), lambda: PgFlowPersistence().bind(sync_pool), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s)
@@ -143,6 +156,7 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
 
     deps = Deps(settings=settings, llm=llm, web=web, retriever=retriever, store=store, sleep=no_sleep, verify_delays=verify_delays, **crews)
     _crews(deps)
+    _news(deps, MemoryNewsStore(), HashEmbeddings())
     runner = FlowRunner(SPECS, store, MemoryLocks(), lambda: MemoryFlowPersistence().bind(store), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))

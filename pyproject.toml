@@ -25,6 +25,11 @@ dependencies = [
   "prometheus-client==0.26.0",
   "opentelemetry-sdk==1.45.1",
   "opentelemetry-exporter-otlp-proto-http==1.45.1",
+  # News desk ML (docs/news/ML.md): CPU-only. scikit-learn (topic classifier, metrics), LightGBM (learned ranker; needs
+  # libgomp1 in the image), datasketch (MinHash LSH near-duplicates). Newest releases ≥ 2 weeks old on 2026-11-10.
+  "scikit-learn==1.9.1",
+  "lightgbm==4.7.0",
+  "datasketch==2.0.0",
 ]
 
 [dependency-groups]
