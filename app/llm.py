@@ -111,7 +111,7 @@ class PgSpendStore:
         start = datetime(now.year, now.month, 1, tzinfo=UTC)
         async with self.pool.connection() as c:
             cur = await c.execute(
-                "select coalesce(sum(cost_usd), 0)::float8 as s from seo_llm_usage where at >= %s and purpose not like 'ask%%'", (start,)
+                "select coalesce(sum(cost_usd), 0)::float8 as s from seo_llm_usage where at >= %s and purpose not like 'ask%%' and purpose not like 'news%%'", (start,)
             )
             spent = float((await cur.fetchone())["s"])
             cur = await c.execute(
@@ -148,7 +148,7 @@ class MemorySpendStore:
     preexisting_usd: float = 0.0
 
     async def month_spend(self, now: datetime) -> float:
-        return self.preexisting_usd + sum(r["cost_usd"] for r in self.rows if not r["purpose"].startswith("ask"))
+        return self.preexisting_usd + sum(r["cost_usd"] for r in self.rows if not r["purpose"].startswith(("ask", "news")))
 
     async def day_spend(self, now: datetime, purpose_prefix: str) -> float:
         return sum(r["cost_usd"] for r in self.rows if r["purpose"].startswith(purpose_prefix))
@@ -167,6 +167,8 @@ class BudgetGuard:
     async def ensure(self, model: str, input_chars: int, max_tokens: int, purpose: str) -> None:
         now = self.clock()
         est = estimate_cost_usd(model, input_chars, max_tokens)
+        if purpose.startswith("news"):
+            return  # the news desk has its own per-job and global caps (app/news/budget.py), checked before every call
         if not purpose.startswith("ask"):
             month = await self.store.month_spend(now)
             if month + est > self.monthly_usd:
@@ -220,10 +222,14 @@ class CallSpec:
     max_tokens: int = 4096
     draft_id: str | None = None
     effort: str | None = None  # output_config.effort; None = the model's default
+    # News desk: images for a vision check (media type, bytes), sent before the text. Alt text is written by a model
+    # looking at the final image, never from the generation prompt (docs/news/IMAGES.md).
+    images: list[tuple[str, bytes]] = field(default_factory=list)
 
     @property
     def input_chars(self) -> int:
-        return len(self.user) + sum(len(s) for s in self.cached_system)
+        # An image costs roughly (w × h) / 750 tokens; budget estimates count a 1200×630 image as ~1,000 tokens.
+        return len(self.user) + sum(len(s) for s in self.cached_system) + 3500 * len(self.images)
 
 
 class Llm(Protocol):
@@ -286,7 +292,12 @@ class AnthropicLlm:
         self.client = client
 
     def _kw(self, spec: CallSpec) -> dict[str, Any]:
-        kw: dict[str, Any] = {"model": spec.model, "max_tokens": spec.max_tokens, "system": _system_blocks(spec.cached_system), "messages": [{"role": "user", "content": spec.user}]}
+        content: Any = spec.user
+        if spec.images:
+            import base64
+
+            content = [*({"type": "image", "source": {"type": "base64", "media_type": mt, "data": base64.b64encode(b).decode()}} for mt, b in spec.images), {"type": "text", "text": spec.user}]
+        kw: dict[str, Any] = {"model": spec.model, "max_tokens": spec.max_tokens, "system": _system_blocks(spec.cached_system), "messages": [{"role": "user", "content": content}]}
         if spec.model in FALLBACK_MODELS:
             kw.update(betas=[FALLBACK_BETA], fallbacks="default")
         if spec.effort:

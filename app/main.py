@@ -37,10 +37,12 @@ from .config import Settings, load_settings
 from .crews.editorial import EditorialCrew
 from .crews.optimization import OptimizationCrew
 from .crews.report import ReportCrew
+from .embeddings import HashEmbeddings
 from .flows import SPECS, check_kickoff
 from .flows.base import Deps
 from .index import MemoryRetriever, PgVectorIndex
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
+from .news.store import MemoryNewsStore, PgNewsStore
 from .runs import FlowRunner, MemoryFlowPersistence, MemoryLocks, MemoryRunStore, PgAdvisoryLocks, PgFlowPersistence, PgRunStore, RunError, view
 from .schemas import AskRequest
 from .services import review
@@ -101,6 +103,16 @@ def _crews(deps: Deps) -> None:
     deps.report_crew = deps.report_crew or (lambda: ReportCrew(s, llm, web, ret))
 
 
+def _news(deps: Deps, store: Any, embeddings: Any) -> None:
+    """News desk dependencies (app/flows/news.py). Tests may pre-set any of these in deps.extra."""
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        return await embeddings.embed(texts)
+
+    deps.extra.setdefault("news_store", store)
+    deps.extra.setdefault("news_embed", embed)
+
+
 async def build_container(settings: Settings) -> Container:
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool, ConnectionPool
@@ -125,6 +137,7 @@ async def build_container(settings: Settings) -> Container:
     store = PgRunStore(pool)
     deps = Deps(settings=settings, llm=llm, web=web, retriever=index, store=store)
     _crews(deps)
+    _news(deps, PgNewsStore(pool), index.emb)
     runner = FlowRunner(SPECS, store, PgAdvisoryLocks(settings.database_url), lambda: PgFlowPersistence().bind(sync_pool), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s)
@@ -143,6 +156,7 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
 
     deps = Deps(settings=settings, llm=llm, web=web, retriever=retriever, store=store, sleep=no_sleep, verify_delays=verify_delays, **crews)
     _crews(deps)
+    _news(deps, MemoryNewsStore(), HashEmbeddings())
     runner = FlowRunner(SPECS, store, MemoryLocks(), lambda: MemoryFlowPersistence().bind(store), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))
@@ -150,6 +164,35 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True)
     deps.reindex = c.reindex
     return c
+
+
+async def _news_gauges(conn: Any) -> None:
+    """Restart-safe alert inputs for the news desk (like D-18): computed from the tables, not process counters."""
+    try:
+        cur = await conn.execute(
+            """select j.id::text as job,
+                 (select count(*) from (select status from news_runs r where r.job_id = j.id and r.kind = 'job' and not r.dry_run and r.status not in ('queued', 'running') order by started_at desc limit 5) x
+                  where x.status = 'failed')::int as recent_failed,
+                 (select status from news_runs r where r.job_id = j.id and r.kind = 'job' and not r.dry_run and r.status not in ('queued', 'running') order by started_at desc limit 1) as last_status,
+                 (select status from news_runs r where r.job_id = j.id and r.kind = 'job' and not r.dry_run and r.status not in ('queued', 'running') order by started_at desc offset 1 limit 1) as prev_status,
+                 extract(epoch from (select max(created_at) from news_articles a where a.job_id = j.id and a.status in ('ready_for_review', 'published')))::float8 as last_draft
+               from news_jobs j where j.deleted_at is null and j.enabled limit 25"""
+        )
+        for r in await cur.fetchall():
+            consecutive = 2 if r["last_status"] == "failed" and r["prev_status"] == "failed" else (1 if r["last_status"] == "failed" else 0)
+            metrics.NEWS_JOB_CONSECUTIVE_FAILURES.labels(news_job=r["job"]).set(consecutive)
+            metrics.NEWS_JOB_LAST_DRAFT.labels(news_job=r["job"]).set(float(r["last_draft"] or 0))
+        cur = await conn.execute(
+            "select count(*) filter (where status = 'failed_quality')::float8 / nullif(count(*) filter (where status in ('failed_quality', 'ready_for_review', 'published', 'rejected', 'incomplete')), 0) as ratio from news_articles where created_at > now() - interval '7 days'"
+        )
+        row = await cur.fetchone()
+        metrics.NEWS_QUALITY_FAILURE_RATIO.set(float(row["ratio"] or 0))
+        cur = await conn.execute(
+            "select coalesce(max(extract(epoch from (now() - coalesce(last_success_at, created_at)))), 0)::float8 as s from news_sources where enabled and deleted_at is null and consecutive_errors > 0"
+        )
+        metrics.NEWS_SOURCE_FAILING_SINCE.set(float((await cur.fetchone())["s"] or 0))
+    except Exception:  # noqa: S110 - the news tables may not exist yet (migration 0017 not applied)
+        pass
 
 
 async def _gauges(c: Container) -> None:
@@ -167,6 +210,7 @@ async def _gauges(c: Container) -> None:
                     cur = await conn.execute("select flow_name, extract(epoch from max(finished_at))::float8 as t from seo_flow_runs where status = 'succeeded' group by flow_name")
                     for r in await cur.fetchall():
                         metrics.LAST_SUCCESS.labels(flow=metrics.flow_label(r["flow_name"])).set(float(r["t"] or 0))
+                    await _news_gauges(conn)
             if isinstance(c.ask.log, PgAskLog):
                 await c.ask.log.prune(c.settings.ask_retention_days)
         except Exception:  # noqa: S110 - gauges are best effort

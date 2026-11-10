@@ -16,6 +16,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 ALLOWED_TOOLS = frozenset({"read_article", "vector_search", "gsc_queries_for_topic", "gsc_queries_for_page", "style_guide", "fetch_allowlisted_docs"})
+# News Desk Crew (app/news/crew.py): read-only too. They are implemented by NewsToolContext (app/news/tools.py); a context
+# without them refuses the name, so an SEO crew can never be handed a news tool by mistake.
+NEWS_TOOLS = frozenset({"read_news_item", "fetch_allowlisted", "vector_search_site", "fact_sheet", "writing_profile", "image_profile"})
+ALL_TOOLS = ALLOWED_TOOLS | NEWS_TOOLS
 
 EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
@@ -93,9 +97,16 @@ class ToolSpec:
 
 
 def build_tools(names: list[str], ctx: ToolContext) -> list[ToolSpec]:
-    unknown = [n for n in names if n not in ALLOWED_TOOLS]
+    unknown = [n for n in names if n not in ALL_TOOLS]
     if unknown:
         raise ToolError(f"tool(s) not on the allowlist: {', '.join(unknown)}")
+    news = [n for n in names if n in NEWS_TOOLS]
+    if news:
+        specs = getattr(ctx, "news_tool_specs", None)
+        if specs is None:
+            raise ToolError(f"news tool(s) need a news tool context: {', '.join(news)}")
+        reg = specs()
+        return [reg[n] for n in names]
     registry: dict[str, ToolSpec] = {
         "read_article": ToolSpec("read_article", "Read one of this site's articles by path (/blog/slug) or id. Input: the path or id.", ctx.read_article),
         "vector_search": ToolSpec("vector_search", "Search this site's articles by meaning. Input: a short query. Returns titles, paths, sections and excerpts.", ctx.vector_search),

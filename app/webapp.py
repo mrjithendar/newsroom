@@ -56,6 +56,15 @@ class WebApp(Protocol):
     async def report_notify(self, report_id: str) -> dict[str, Any]: ...
     async def report_pdf(self, report_id: str, pdf: bytes) -> dict[str, Any]: ...
     async def cluster_ask_gaps(self) -> dict[str, Any]: ...
+    # News desk (services/www/src/lib/news/callbacks.ts)
+    async def news_fetch(self, body: dict[str, Any]) -> dict[str, Any]: ...
+    async def news_save_draft(self, body: dict[str, Any]) -> dict[str, Any]: ...
+    async def news_store_media(self, body: dict[str, Any]) -> dict[str, Any]: ...
+    async def news_generate_image(self, body: dict[str, Any]) -> dict[str, Any]: ...
+    async def news_update_draft_image(self, draft_id: str, image: dict[str, Any]) -> dict[str, Any]: ...
+    async def news_site_signals(self) -> dict[str, Any]: ...
+    async def news_notify(self, body: dict[str, Any]) -> dict[str, Any]: ...
+    async def news_collect_performance(self) -> dict[str, Any]: ...
 
 
 class HttpWebApp:
@@ -173,3 +182,32 @@ class HttpWebApp:
 
     async def cluster_ask_gaps(self) -> dict[str, Any]:
         return await self._req("POST", "/ask-gaps/cluster", json={})
+
+    # --- news desk ------------------------------------------------------------------------------------------------
+    # The web app fetches (v1 SSRF-safe fetcher, robots.txt, conditional GET), creates the CMS draft post + review draft,
+    # stores covers in the existing media library and sends notifications. The agent itself has no internet egress
+    # except the Anthropic API (and the OpenAI Images API only if that provider is configured).
+
+    async def news_fetch(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._req("POST", "/news/fetch", json=body, timeout=45)
+
+    async def news_save_draft(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._req("POST", "/news/drafts", json=body, timeout=120)
+
+    async def news_store_media(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._req("POST", "/news/media", json=body, timeout=120)
+
+    async def news_generate_image(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._req("POST", "/news/images/generate", json=body, timeout=300)
+
+    async def news_update_draft_image(self, draft_id: str, image: dict[str, Any]) -> dict[str, Any]:
+        return await self._req("POST", f"/news/drafts/{draft_id}/image", json={"image": image})
+
+    async def news_site_signals(self) -> dict[str, Any]:
+        return await self._req("GET", "/news/site-signals")
+
+    async def news_notify(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._req("POST", "/news/notify", json=body)
+
+    async def news_collect_performance(self) -> dict[str, Any]:
+        return await self._req("POST", "/news/performance", json={}, timeout=120)
