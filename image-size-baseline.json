@@ -1,8 +1,8 @@
 {
   "image": "seo-agent:ci (linux/amd64, the pull request build in ci-seo-agent.yml)",
-  "uncompressed_bytes": null,
-  "compressed_bytes": null,
-  "measured": null,
-  "commit": null,
-  "note": "Not measured yet: no container runtime on the development machine. Filled from the first CI run of feature/seo-v5-ml-rag (scripts/image-size.sh prints both numbers)."
+  "uncompressed_bytes": 381485288,
+  "compressed_bytes": 379873084,
+  "measured": "2026-11-10",
+  "commit": "b9c0371",
+  "note": "From CI run 42839223908 (PR #35, v5 + lock fix). The two numbers are nearly equal: the runner's Docker (containerd image store) reports layer sizes as stored, i.e. already compressed, so 'uncompressed' here is the image-store size, not the unpacked filesystem. The +15 % gate compares like with like either way."
 }
