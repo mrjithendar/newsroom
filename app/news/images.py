@@ -129,7 +129,7 @@ def render_template(brief: Brief, size: tuple[int, int] = (1600, 900), palette: 
     d.rounded_rectangle([pad, pad, pad + int(d.textlength(brief.category_label.upper(), font=label)) + 32, pad + w // 55 + 22], radius=12, fill=(255, 255, 255))
     d.text((pad + 16, pad + 10), brief.category_label.upper(), font=label, fill=a)
     title_font = ImageFont.load_default(size=max(24, w // 22))
-    lines = textwrap.wrap(brief.title, width=26)[:4]
+    lines = textwrap.wrap(brief.title, width=26, break_on_hyphens=False)[:4]
     y = int(h * 0.36)
     for line in lines:
         d.text((pad, y), line, font=title_font, fill=(255, 255, 255))

@@ -166,6 +166,35 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     return c
 
 
+async def _news_gauges(conn: Any) -> None:
+    """Restart-safe alert inputs for the news desk (like D-18): computed from the tables, not process counters."""
+    try:
+        cur = await conn.execute(
+            """select j.id::text as job,
+                 (select count(*) from (select status from news_runs r where r.job_id = j.id and r.kind = 'job' and not r.dry_run and r.status not in ('queued', 'running') order by started_at desc limit 5) x
+                  where x.status = 'failed')::int as recent_failed,
+                 (select status from news_runs r where r.job_id = j.id and r.kind = 'job' and not r.dry_run and r.status not in ('queued', 'running') order by started_at desc limit 1) as last_status,
+                 (select status from news_runs r where r.job_id = j.id and r.kind = 'job' and not r.dry_run and r.status not in ('queued', 'running') order by started_at desc offset 1 limit 1) as prev_status,
+                 extract(epoch from (select max(created_at) from news_articles a where a.job_id = j.id and a.status in ('ready_for_review', 'published')))::float8 as last_draft
+               from news_jobs j where j.deleted_at is null and j.enabled limit 25"""
+        )
+        for r in await cur.fetchall():
+            consecutive = 2 if r["last_status"] == "failed" and r["prev_status"] == "failed" else (1 if r["last_status"] == "failed" else 0)
+            metrics.NEWS_JOB_CONSECUTIVE_FAILURES.labels(news_job=r["job"]).set(consecutive)
+            metrics.NEWS_JOB_LAST_DRAFT.labels(news_job=r["job"]).set(float(r["last_draft"] or 0))
+        cur = await conn.execute(
+            "select count(*) filter (where status = 'failed_quality')::float8 / nullif(count(*) filter (where status in ('failed_quality', 'ready_for_review', 'published', 'rejected', 'incomplete')), 0) as ratio from news_articles where created_at > now() - interval '7 days'"
+        )
+        row = await cur.fetchone()
+        metrics.NEWS_QUALITY_FAILURE_RATIO.set(float(row["ratio"] or 0))
+        cur = await conn.execute(
+            "select coalesce(max(extract(epoch from (now() - coalesce(last_success_at, created_at)))), 0)::float8 as s from news_sources where enabled and deleted_at is null and consecutive_errors > 0"
+        )
+        metrics.NEWS_SOURCE_FAILING_SINCE.set(float((await cur.fetchone())["s"] or 0))
+    except Exception:  # noqa: S110 - the news tables may not exist yet (migration 0017 not applied)
+        pass
+
+
 async def _gauges(c: Container) -> None:
     while True:
         try:
@@ -181,6 +210,7 @@ async def _gauges(c: Container) -> None:
                     cur = await conn.execute("select flow_name, extract(epoch from max(finished_at))::float8 as t from seo_flow_runs where status = 'succeeded' group by flow_name")
                     for r in await cur.fetchall():
                         metrics.LAST_SUCCESS.labels(flow=metrics.flow_label(r["flow_name"])).set(float(r["t"] or 0))
+                    await _news_gauges(conn)
             if isinstance(c.ask.log, PgAskLog):
                 await c.ask.log.prune(c.settings.ask_retention_days)
         except Exception:  # noqa: S110 - gauges are best effort

@@ -343,3 +343,40 @@ def test_alt_text_clamp() -> None:
 
 
 _ = asyncio
+
+
+# --- MCP (news tools) -----------------------------------------------------------------------------------------------
+
+
+async def test_news_mcp_tools_read_run_and_reject_but_never_approve(llm: Any) -> None:
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from app.mcp import create_edge_app
+    from tests.test_mcp import as_admin
+
+    llm.queue("news.vision", SAFE)
+    c, web, store = setup(llm)
+    await run(c, "news_job_flow", {"job_id": JOB})
+    art = next(iter(store.articles.values()))
+    app = create_edge_app(c)
+    async with as_admin(["seo:read", "seo:flows", "seo:review:reject"]), create_connected_server_and_client_session(app.state.admin) as s:
+        names = {t.name for t in (await s.list_tools()).tools}
+        assert {"list_news_jobs", "get_news_run", "kickoff_news_job", "reject_news_draft"} <= names
+        assert not [n for n in names if "approve" in n or "publish" in n]
+        drafts = (await s.call_tool("list_news_drafts", {})).structuredContent
+        assert drafts["drafts"][0]["review_url"].endswith(art["draft_id"])
+        runs = (await s.call_tool("list_news_runs", {"job_id": JOB})).structuredContent
+        detail = (await s.call_tool("get_news_run", {"run_id": runs["runs"][0]["id"]})).structuredContent
+        assert any(st["step"] == "select" for st in detail["steps"]) and "untrusted" in str(detail["logs"]).lower()
+        r = await s.call_tool("kickoff_news_job", {"job_id": JOB})
+        assert not r.isError
+        await c.runner.wait(r.structuredContent["run_id"], 60)
+        rej = await s.call_tool("reject_news_draft", {"draft_id": art["draft_id"], "reason": "not for us"})
+        assert not rej.isError and store.articles[art["id"]]["status"] == "rejected"
+        bad = await s.call_tool("kickoff_flow", {"flow_name": "news_draft_flow", "inputs": {}})
+        assert bad.isError  # only news_job_flow, via its own tool
+    assert web.published == []
+    async with create_connected_server_and_client_session(app.state.public) as s:
+        store.posts["p1"] = {"collection": "news", "status": "published", "title": "Kubernetes 1.35 resize", "path": "/news/k8s-135", "body": "pod resize", "description": "d", "published_at": NOW, "updated_at": None}
+        res = (await s.call_tool("search_news", {"query": "resize", "since": "2026-11-01"})).structuredContent
+        assert res["results"][0]["url"].endswith("/news/k8s-135")

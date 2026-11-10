@@ -73,7 +73,8 @@ def mcp_tool_label(tool: str) -> str:
     return tool if tool in MCP_TOOLS else "other"
 
 
-# --- News desk (docs/news/RUNBOOK.md "Metrics"). `job` is the news job id: bounded because the web app refuses more than
+# --- News desk (docs/news/RUNBOOK.md "Metrics"). `news_job` is the news job id (not `job`, which Prometheus sets to the
+# scrape job): bounded because the web app refuses more than
 # MAX_NEWS_JOBS (25) jobs; every other label comes from a fixed set below.
 MAX_NEWS_JOBS = 25
 NEWS_SOURCE_TYPES = {"rss", "atom", "json_api", "github_releases", "sitemap", "html_allowlisted"}
@@ -84,8 +85,8 @@ NEWS_IMAGE_PROVIDERS = {"template", "gemini", "openai"}
 NEWS_COST_KINDS = {"llm", "image"}
 NEWS_MODELS = {"classifier", "ranker"}
 
-NEWS_RUNS = Counter("news_runs_total", "News job runs by final status.", ["job", "status"], registry=REGISTRY)
-NEWS_RUN_DURATION = Histogram("news_run_duration_seconds", "News job run duration.", ["job"], buckets=_BUCKETS, registry=REGISTRY)
+NEWS_RUNS = Counter("news_runs_total", "News job runs by final status.", ["news_job", "status"], registry=REGISTRY)
+NEWS_RUN_DURATION = Histogram("news_run_duration_seconds", "News job run duration.", ["news_job"], buckets=_BUCKETS, registry=REGISTRY)
 NEWS_ITEMS_FETCHED = Counter("news_items_fetched_total", "Feed items fetched (before dedupe).", ["source_type"], registry=REGISTRY)
 NEWS_SOURCE_ERRORS = Counter("news_source_errors_total", "Source fetch/parse failures.", ["source_type"], registry=REGISTRY)
 NEWS_CANDIDATES = Counter("news_candidates_total", "Scored candidates by decision.", ["decision"], registry=REGISTRY)
@@ -96,8 +97,8 @@ NEWS_COST = Counter("news_cost_usd_total", "News desk spend in USD.", ["kind"], 
 NEWS_MODEL_AUC = Gauge("news_model_auc", "Held-out AUC (ranker) / macro F1 (classifier) of the active model.", ["model"], registry=REGISTRY)
 NEWS_BUDGET_RATIO = Gauge("news_budget_used_ratio", "News spend / cap for the current period.", ["scope"], registry=REGISTRY)
 NEWS_SOURCE_FAILING_SINCE = Gauge("news_source_failing_seconds", "Seconds since the longest-failing enabled source last succeeded (0 = all healthy).", registry=REGISTRY)
-NEWS_JOB_CONSECUTIVE_FAILURES = Gauge("news_job_consecutive_failures", "Consecutive failed runs per job.", ["job"], registry=REGISTRY)
-NEWS_JOB_LAST_DRAFT = Gauge("news_job_last_draft_timestamp_seconds", "Last draft that reached review, per job.", ["job"], registry=REGISTRY)
+NEWS_JOB_CONSECUTIVE_FAILURES = Gauge("news_job_consecutive_failures", "Consecutive failed runs per job.", ["news_job"], registry=REGISTRY)
+NEWS_JOB_LAST_DRAFT = Gauge("news_job_last_draft_timestamp_seconds", "Last draft that reached review, per job.", ["news_job"], registry=REGISTRY)
 NEWS_QUALITY_FAILURE_RATIO = Gauge("news_quality_failure_ratio_7d", "Share of drafts failing quality over 7 days.", registry=REGISTRY)
 
 

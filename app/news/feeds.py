@@ -175,7 +175,29 @@ def parse_html_page(body: str, url: str) -> list[RawItem]:
     return [RawItem(url, title, None, clean_text(main.group(0) if main else body, 4000))]
 
 
+def parse_github_releases(body: str) -> list[RawItem]:
+    """GitHub REST API `GET /repos/{owner}/{repo}/releases` (github.com's own robots.txt disallows the .atom feeds for
+    every crawler, so the official API is the allowed way in). Drafts and pre-releases are skipped."""
+    try:
+        data = json.loads(body)
+    except ValueError as e:
+        raise FeedError("invalid JSON from the GitHub releases API") from e
+    if not isinstance(data, list):
+        raise FeedError(str((data or {}).get("message", "unexpected GitHub API response"))[:200] if isinstance(data, dict) else "unexpected GitHub API response")
+    out = []
+    for r in data:
+        if not isinstance(r, dict) or r.get("draft") or r.get("prerelease") or not r.get("html_url"):
+            continue
+        repo = "/".join(str(r["html_url"]).split("/")[3:5])
+        name = str(r.get("name") or r.get("tag_name") or "release")
+        title = name if repo.split("/")[-1].lower() in name.lower() else f"{repo} {name}"
+        out.append(RawItem(str(r["html_url"]), title[:300], parse_date(r.get("published_at")), clean_text(str(r.get("body") or ""), 4000), {"tag": r.get("tag_name")}))
+    return out[:MAX_ITEMS_PER_FETCH]
+
+
 def parse_feed(source_type: str, body: str, url: str) -> list[RawItem]:
+    if source_type == "github_releases" and body.lstrip().startswith(("[", "{")):
+        return parse_github_releases(body)
     if source_type in ("rss", "atom", "github_releases"):
         return parse_rss_or_atom(body)
     if source_type == "json_api":

@@ -91,6 +91,11 @@ class NewsStore(Protocol):
     async def edited_articles(self, since: datetime, limit: int) -> list[dict[str, Any]]: ...
     async def add_feedback(self, row: dict[str, Any]) -> None: ...
     async def prune(self, log_days: int, item_days: int, now: datetime) -> dict[str, int]: ...
+    # read models for the admin/public MCP tools
+    async def list_runs(self, job_id: str | None, limit: int) -> list[dict[str, Any]]: ...
+    async def list_articles(self, status: str | None, limit: int) -> list[dict[str, Any]]: ...
+    async def mark_rejected(self, draft_id: str, reason: str, actor: str) -> dict[str, Any] | None: ...
+    async def published_news(self, query: str, since: datetime | None, limit: int) -> list[dict[str, Any]]: ...
 
 
 # --- PostgreSQL -----------------------------------------------------------------------------------------------------
@@ -439,6 +444,33 @@ class PgNewsStore:
             out["candidates"] = cur.rowcount
         return out
 
+    async def list_runs(self, job_id: str | None, limit: int) -> list[dict[str, Any]]:
+        return await self._all(
+            "select r.id, r.job_id, j.name as job_name, r.kind, r.trigger, r.status, r.dry_run, r.counters, r.cost_usd, r.image_cost_usd, r.error_summary, r.started_at, r.finished_at from news_runs r left join news_jobs j on j.id = r.job_id where (%s::text is null or r.job_id::text = %s) order by r.started_at desc limit %s",
+            (job_id, job_id, max(1, min(limit, 50))),
+        )
+
+    async def list_articles(self, status: str | None, limit: int) -> list[dict[str, Any]]:
+        return await self._all(
+            "select a.id, a.job_id, j.name as job_name, a.status, a.mode, a.draft_id, a.score, a.cost_usd, a.created_at, a.generated_doc->>'title' as title, a.quality->'failed' as failed_gates from news_articles a left join news_jobs j on j.id = a.job_id where (%s::text is null or a.status = %s) order by a.created_at desc limit %s",
+            (status, status, max(1, min(limit, 50))),
+        )
+
+    async def mark_rejected(self, draft_id: str, reason: str, actor: str) -> dict[str, Any] | None:
+        a = await self._one("update news_articles set status = 'rejected', review_outcome = 'rejected', reject_category = 'other', reject_reason = %s, reviewed_at = now(), updated_at = now() where draft_id::text = %s and status = 'ready_for_review' returning id, cluster_id, job_id", (reason[:2000], draft_id))
+        if a:
+            await self.add_feedback({"article_id": a["id"], "cluster_id": a.get("cluster_id"), "job_id": a.get("job_id"), "kind": "reject", "reason_category": "other", "reason": reason[:2000], "actor": actor})
+        return a
+
+    async def published_news(self, query: str, since: datetime | None, limit: int) -> list[dict[str, Any]]:
+        q = f"%{query.replace('%', '').replace('_', ' ')[:120]}%"
+        return await self._all(
+            """select title, '/' || collection || '/' || slug as path, description, published_at, updated_at from post
+               where collection = 'news' and status = 'published' and deleted_at is null and noindex = false and (%(since)s::timestamptz is null or published_at >= %(since)s)
+                 and (title ilike %(q)s or description ilike %(q)s or body ilike %(q)s) order by published_at desc limit %(n)s""",
+            {"q": q, "since": since, "n": max(1, min(limit, 20))},
+        )
+
 
 # --- In memory (tests) ----------------------------------------------------------------------------------------------
 
@@ -715,3 +747,24 @@ class MemoryNewsStore:
         before = len(self.log_rows)
         self.log_rows = [r for r in self.log_rows if r["at"] >= now - timedelta(days=log_days)]
         return {"logs": before - len(self.log_rows), "items": 0, "candidates": 0}
+
+    async def list_runs(self, job_id: str | None, limit: int) -> list[dict[str, Any]]:
+        rows = [r for r in self.runs.values() if job_id is None or r.get("job_id") == job_id]
+        return sorted((dict(r) for r in rows), key=lambda r: r["started_at"], reverse=True)[:limit]
+
+    async def list_articles(self, status: str | None, limit: int) -> list[dict[str, Any]]:
+        rows = [dict(a, title=(a.get("generated_doc") or {}).get("title")) for a in self.articles.values() if status is None or a["status"] == status]
+        return sorted(rows, key=lambda a: a["created_at"], reverse=True)[:limit]
+
+    async def mark_rejected(self, draft_id: str, reason: str, actor: str) -> dict[str, Any] | None:
+        for a in self.articles.values():
+            if a.get("draft_id") == draft_id and a["status"] == "ready_for_review":
+                a.update(status="rejected", review_outcome="rejected", reject_category="other", reject_reason=reason)
+                await self.add_feedback({"article_id": a["id"], "kind": "reject", "reason_category": "other", "reason": reason, "actor": actor})
+                return dict(a)
+        return None
+
+    async def published_news(self, query: str, since: datetime | None, limit: int) -> list[dict[str, Any]]:
+        q = query.lower()
+        out = [p for p in self.posts.values() if p.get("collection") == "news" and p.get("status") == "published" and (since is None or p["published_at"] >= since) and (q in p["title"].lower() or q in p.get("body", "").lower())]
+        return sorted(out, key=lambda p: p["published_at"], reverse=True)[:limit]

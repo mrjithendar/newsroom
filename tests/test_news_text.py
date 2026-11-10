@@ -156,3 +156,15 @@ def test_kill_switch_defaults_off_and_settings_can_only_pause() -> None:
     assert not load_news_settings({"paused": True}, {"NEWS_DESK_ENABLED": "true"}).enabled
     assert not load_news_settings({"paused": False, "env_enabled": True}, {}).enabled  # a setting row cannot switch it on
     assert load_news_settings({}, {"NEWS_IMAGE_PROVIDER": "gemini"}).image_provider == "gemini"
+
+
+def test_github_releases_api_skips_drafts_and_prereleases() -> None:
+    body = json.dumps([
+        {"html_url": "https://github.com/kubernetes/kubernetes/releases/tag/v1.35.0", "name": "Kubernetes v1.35.0", "tag_name": "v1.35.0", "published_at": "2026-11-10T04:00:00Z", "body": "Notes", "draft": False, "prerelease": False},
+        {"html_url": "https://github.com/kubernetes/kubernetes/releases/tag/v1.36.0-alpha.1", "name": "v1.36.0-alpha.1", "tag_name": "v1.36.0-alpha.1", "prerelease": True},
+        {"html_url": "https://github.com/hashicorp/terraform/releases/tag/v1.14.2", "name": "v1.14.2", "tag_name": "v1.14.2", "published_at": "2026-11-09T04:00:00Z", "body": "", "draft": False, "prerelease": False},
+    ])
+    r = feeds.parse_feed("github_releases", body, "u")
+    assert [x.title for x in r] == ["Kubernetes v1.35.0", "hashicorp/terraform v1.14.2"]
+    with pytest.raises(feeds.FeedError):
+        feeds.parse_feed("github_releases", json.dumps({"message": "API rate limit exceeded"}), "u")

@@ -191,9 +191,9 @@ class NewsHelpers:
         self.state.add_cost(0)  # cost lives on news_runs (summing seo_flow_runs too would double count)
         metrics.NEWS_COST.labels(kind="llm").inc(float(run.get("cost_usd") or 0))
         if job:
-            metrics.NEWS_RUNS.labels(job=job.id[:36], status=status).inc()
+            metrics.NEWS_RUNS.labels(news_job=job.id[:36], status=status).inc()
             if started is not None:
-                metrics.NEWS_RUN_DURATION.labels(job=job.id[:36]).observe(time.monotonic() - started)
+                metrics.NEWS_RUN_DURATION.labels(news_job=job.id[:36]).observe(time.monotonic() - started)
 
 
 # --- news_job_flow --------------------------------------------------------------------------------------------------
