@@ -7,6 +7,7 @@ that need its data (MDX compiles, internal links exist, the title is unique site
 
 from __future__ import annotations
 
+import difflib
 import functools
 import json
 import re
@@ -208,10 +209,11 @@ def critical_tokens(sentence: str) -> set[str]:
 
 def _supported(token: str, corpus: str, corpus_digits: str) -> bool:
     t = token.lower()
-    if t in corpus:
+    # Whole-token match: "10" must not be supported by "2010", nor "1.2" by "1.2.3" or "v11.2".
+    if re.search(rf"(?<![\w.]){re.escape(t)}(?![\w]|\.\d)", corpus):
         return True
     digits = re.sub(r"[^\d.]", "", t)
-    if digits and re.search(rf"(?<![\d.]){re.escape(digits)}(?![\d])", corpus_digits):
+    if digits and re.search(rf"(?<![\d.]){re.escape(digits)}(?!\d|\.\d)", corpus_digits):
         return True
     if DATE.fullmatch(token):  # "Nov 4" vs "November 4, 2026": compare month + day
         m = re.match(r"([A-Za-z]{3})[a-z]*\.? (\d{1,2})", token)
@@ -220,10 +222,48 @@ def _supported(token: str, corpus: str, corpus_digits: str) -> bool:
     return False
 
 
+SNIPPET_MIN_RATIO = 0.85  # fuzzy match of a fact-sheet snippet against source text (token-level)
+
+
+def snippet_in_sources(snippet: str, sources: list[SourceDoc], min_ratio: float = SNIPPET_MIN_RATIO) -> bool:
+    """Whether the researcher's supporting snippet really occurs in a source: exact after normalising case, punctuation
+    and whitespace, else the best token-window match (difflib) reaches `min_ratio`. Short snippets must match exactly."""
+    toks = words(snippet)
+    if not toks:
+        return False
+    needle = " ".join(toks)
+    n = len(toks)
+    for s in sources:
+        st = words(f"{s.title} {s.text}")
+        if needle in " ".join(st):
+            return True
+        if n < 6 or len(st) < n:
+            continue
+        sm = difflib.SequenceMatcher(None, autojunk=False)
+        sm.set_seq2(toks)
+        anchors = set(toks)
+        step = max(1, n // 4)
+        for i in range(0, len(st) - n + 1, step):
+            window = st[i : i + n]
+            if not anchors.intersection(window):
+                continue
+            sm.set_seq1(window)
+            if sm.quick_ratio() >= min_ratio and sm.ratio() >= min_ratio:
+                return True
+    return False
+
+
 def gate_grounding(draft: NewsDraft, sources: list[SourceDoc], facts: FactSheet) -> Gate:
+    """Every critical token (numbers, versions, dates, CVE ids) in the draft must appear in a *source*. The fact sheet is
+    the researcher's own output, so its claim text is never evidence: only snippets verified against the sources'
+    text count (and they are source text anyway); a claim whose snippet is not found is reported as unverified."""
     g = Gate("grounding")
-    corpus = "\n".join([*(c.claim + " " + c.snippet for c in facts.claims), *(s.title + " " + s.text for s in sources)]).lower()
+    unverified = [c for c in facts.claims if not snippet_in_sources(c.snippet, sources)]
+    corpus = "\n".join(s.title + " " + s.text for s in sources).lower()
+    corpus = re.sub(r"\s+", " ", corpus)
     corpus_digits = re.sub(r"(?<=\d),(?=\d{3})", "", corpus)
+    for c in unverified[:10]:
+        g.warnings.append(f"fact-sheet claim not found in any source (ignored as evidence): “{c.claim[:120]}”")
     unmapped: list[dict[str, Any]] = []
     checked = 0
     text = strip_code(draft.body_mdx) + "\n\n" + draft.dek + "\n\n" + "\n".join(draft.key_takeaways)
@@ -248,7 +288,7 @@ def gate_grounding(draft: NewsDraft, sources: list[SourceDoc], facts: FactSheet)
         for name in names:
             if len(name) > 3 and re.search(rf"(?<![\w-]){re.escape(name.lower())}(?![\w-])", body_low) and name.lower() not in corpus:
                 g.warnings.append(f"{name} is mentioned but not in any source (fine as context; check it is not a claim)")
-    g.detail = {"sentences_checked": checked, "unmapped": unmapped[:20]}
+    g.detail = {"sentences_checked": checked, "unmapped": unmapped[:20], "claims": len(facts.claims), "claims_unverified": [c.id or c.claim[:80] for c in unverified][:20]}
     return g
 
 

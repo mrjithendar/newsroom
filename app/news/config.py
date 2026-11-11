@@ -170,7 +170,16 @@ class NewsSettings(BaseModel):
     fast_model: str = "claude-haiku-5-5"
     vision_model: str = "claude-haiku-5-5"
     classifier_threshold: float = 0.55
+    # Probability recorded for a topic Claude assigned (it returns labels, not probabilities). It feeds topic_match, so
+    # keep it near classifier_threshold: high enough to pass, not so high that Claude's picks outrank the model's.
+    claude_topic_p: float = Field(default=0.6, ge=0, le=1)
     ranker_min_feedback: int = 100
+    # Opt-in exploration (docs/news/ML.md "Selection"): share of below-threshold candidates made eligible anyway.
+    explore_rate: float = Field(default=0.0, ge=0, le=0.2)
+    # Items naming more CVE ids than this (advisory roundups) do not use the shared-CVE clustering rule.
+    cve_roundup_max: int = Field(default=5, ge=1, le=100)
+    # Texts shorter than this many words skip MinHash near-dedupe (exact and semantic dedupe still apply).
+    near_dup_min_tokens: int = Field(default=30, ge=0, le=500)
     log_retention_days: int = 90
     item_retention_days: int = 180
     draft_concurrency: int = 2

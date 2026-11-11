@@ -1,10 +1,12 @@
 """Ranking (docs/news/ML.md "Ranking").
 
 v1: transparent weighted features in [0, 1]; score = Σ weight × value; every candidate stores the full breakdown.
-v2: a LightGBM model trained on the owner's approve/reject decisions plus later performance (binary objective, so the
-    output is a probability comparable to the job's score threshold). It replaces v1 only when it beats v1 on the same
-    held-out data on **both** AUC and NDCG@5 (per run). Its explanation is LightGBM's per-feature contributions
-    (`pred_contrib`), shown next to the v1 breakdown. The model version is recorded on every candidate.
+v2: a LightGBM model trained on the owner's approve/reject decisions (binary objective). It replaces v1 only when it
+    beats v1 (each row scored with its own job's weights) and the current v2, if any, on the same held-out data on
+    **both** AUC and NDCG@5 (per run). Its explanation is LightGBM's per-feature contributions (`pred_contrib`), shown
+    next to the v1 breakdown. The model version is recorded on every candidate.
+    Its probabilities are not on v1's scale, so a job's `min_score` (tuned for v1) is mapped through quantiles stored
+    with the model: the v2 threshold keeps the share of candidates v1 would have passed (`RankerModel.threshold_for`).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from .config import FEATURES
+from .monitoring import histogram
 
 V1 = "v1-weighted"
 
@@ -70,12 +73,30 @@ class TrainRow:
     at: datetime
     features: list[float]
     label: int  # 1 approved (or performed well), 0 rejected
+    weights: dict[str, float] | None = None  # the v1 weights of the job that scored this candidate (None: defaults)
+
+
+QUANTILES = 101
 
 
 @dataclass
 class RankerModel:
     version: str
     booster: Any
+    # Score map (stored in the model's metrics): v1 and v2 score quantiles over the same reference candidates.
+    v1_quantiles: list[float] | None = None
+    v2_quantiles: list[float] | None = None
+
+    def threshold_for(self, min_score: float) -> float | None:
+        """The v2 score that passes the same share of candidates as `min_score` passes under v1 (quantile mapping).
+        None without a score map (an older model): the caller then falls back to min_score."""
+        if not self.v1_quantiles or not self.v2_quantiles:
+            return None
+        levels = np.linspace(0.0, 1.0, len(self.v1_quantiles))
+        below = float(np.interp(min_score, self.v1_quantiles, levels, left=0.0, right=1.0))  # share v1 rejects
+        if below >= 1.0:
+            return float(self.v2_quantiles[-1]) + 1e-9  # v1 would pass nothing
+        return float(np.interp(below, np.linspace(0.0, 1.0, len(self.v2_quantiles)), self.v2_quantiles))  # not rounded: ties
 
     def predict(self, rows: list[list[float]]) -> np.ndarray:
         return np.asarray(self.booster.predict(np.asarray(rows, dtype=np.float64)), dtype=np.float64)
@@ -88,10 +109,11 @@ class RankerModel:
         return self.booster.model_to_string().encode()
 
     @classmethod
-    def from_bytes(cls, version: str, data: bytes) -> RankerModel:
+    def from_bytes(cls, version: str, data: bytes, metrics: dict[str, Any] | None = None) -> RankerModel:
         import lightgbm as lgb
 
-        return cls(version, lgb.Booster(model_str=data.decode()))
+        sm = (metrics or {}).get("score_map") or {}
+        return cls(version, lgb.Booster(model_str=data.decode()), sm.get("v1") or None, sm.get("v2") or None)
 
 
 def ndcg_by_run(run_ids: list[str], labels: list[int], scores: list[float], k: int = 5) -> float:
@@ -115,9 +137,25 @@ def evaluate(run_ids: list[str], labels: list[int], scores: list[float]) -> dict
     return {"auc": round(auc, 4), "ndcg5": ndcg_by_run(run_ids, labels, scores), "n": len(labels)}
 
 
-def train_ranker(rows: list[TrainRow], weights: dict[str, float], version: str, seed: int = 7) -> tuple[RankerModel | None, dict[str, Any]]:
+def _v1(r: TrainRow, default: dict[str, float]) -> float:
+    return score_v1(_features_from(r.features), r.weights or default)[0]
+
+
+def score_map(model: RankerModel, reference: list[TrainRow], weights: dict[str, float]) -> dict[str, list[float]]:
+    """v1 and v2 score quantiles over reference candidates (all decisions, not only reviewed ones)."""
+    if not reference:
+        return {}
+    q = np.linspace(0.0, 1.0, QUANTILES)
+    v1 = np.asarray([_v1(r, weights) for r in reference], dtype=np.float64)
+    v2 = model.predict([r.features for r in reference])
+    return {"v1": [float(x) for x in np.quantile(v1, q)], "v2": [float(x) for x in np.quantile(v2, q)]}  # exact: v2 scores tie a lot
+
+
+def train_ranker(rows: list[TrainRow], weights: dict[str, float], version: str, seed: int = 7, *, current: RankerModel | None = None, reference: list[TrainRow] | None = None) -> tuple[RankerModel | None, dict[str, Any]]:
     """Time-ordered split (oldest 80 % train, newest 20 % test). Returns (model, report); model is None when it should
-    not replace v1 (too little data, one class only, or not better than v1 on held-out AUC and NDCG@5)."""
+    not be promoted (too little data, one class only, or not better on held-out AUC and NDCG@5 than v1 and than the
+    `current` v2). v1 scores each row with the row's own job weights (`TrainRow.weights`; `weights` otherwise).
+    `reference`: candidates (any decision) for the v1→v2 score map; the training rows when not given."""
     import lightgbm as lgb
 
     rows = sorted(rows, key=lambda r: r.at)
@@ -134,12 +172,26 @@ def train_ranker(rows: list[TrainRow], weights: dict[str, float], version: str, 
     model = RankerModel(version, booster)
     xt = [r.features for r in test]
     v2_scores = model.predict(xt).tolist()
-    v1_scores = [score_v1(_features_from(r.features), weights)[0] for r in test]
+    v1_scores = [_v1(r, weights) for r in test]
     ids = [r.run_id for r in test]
     labels = [r.label for r in test]
     m2, m1 = evaluate(ids, labels, v2_scores), evaluate(ids, labels, v1_scores)
     better = m2["auc"] > m1["auc"] and m2["ndcg5"] >= m1["ndcg5"]
-    report = {"promoted": better, "v2": m2, "v1": m1, "train": len(train), "test": len(test), "reason": "beats v1 on held-out AUC and NDCG@5" if better else "does not beat v1 on held-out data"}
+    reason = "beats v1 on held-out AUC and NDCG@5" if better else "does not beat v1 on held-out data"
+    report: dict[str, Any] = {"v2": m2, "v1": m1, "train": len(train), "test": len(test)}
+    if current is not None:
+        # The serving v2 may have seen some of these rows in training, which favours it: a conservative comparison.
+        mc = evaluate(ids, labels, current.predict(xt).tolist())
+        report["current"] = {**mc, "version": current.version}
+        if better and not (m2["auc"] > mc["auc"] and m2["ndcg5"] >= mc["ndcg5"]):
+            better, reason = False, f"beats v1 but not the serving model {current.version} on held-out data"
+        elif better:
+            reason = f"beats v1 and the serving model {current.version} on held-out AUC and NDCG@5"
+    ref = reference or rows
+    report["score_map"] = score_map(model, ref, weights)
+    model.v1_quantiles, model.v2_quantiles = report["score_map"].get("v1"), report["score_map"].get("v2")
+    report["score_hist"] = histogram(model.predict([r.features for r in ref]).tolist())  # drift reference (PSI)
+    report.update({"promoted": better, "reason": reason})
     return (model if better else None), report
 
 

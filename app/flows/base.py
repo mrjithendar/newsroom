@@ -21,7 +21,8 @@ from pydantic import BaseModel, PrivateAttr
 
 from .. import metrics
 from ..config import Settings
-from ..llm import Llm
+from ..llm import BudgetExceeded, Llm
+from ..runs import CURRENT_RUN_ID
 from ..tracing import span
 from ..webapp import WebApp, WebAppError
 
@@ -90,11 +91,20 @@ class SeoFlow(Flow[S]):
                 await store.update(run_id, current_step=name)
             except Exception:  # noqa: S110 - the run record must never break a flow
                 pass
-        with span(f"flow.{self.FLOW}.{name}", {"flow": self.FLOW, "step": name}):
-            try:
-                yield
-            finally:
-                metrics.STEP_DURATION.labels(flow=metrics.flow_label(self.FLOW), step=name).observe(time.monotonic() - started)
+        token = CURRENT_RUN_ID.set(str(run_id)) if run_id else None  # model calls in this step carry CallSpec.run_id
+        try:
+            with span(f"flow.{self.FLOW}.{name}", {"flow": self.FLOW, "step": name, "run_id": run_id or ""}):
+                try:
+                    yield
+                finally:
+                    metrics.STEP_DURATION.labels(flow=metrics.flow_label(self.FLOW), step=name).observe(time.monotonic() - started)
+        finally:
+            if token is not None:
+                CURRENT_RUN_ID.reset(token)
+
+    def add_budget_cost(self, e: BudgetExceeded) -> None:
+        """A crew stopped by the budget still spent tokens (crews.common.CrewBudgetExceeded): count them on the run."""
+        self.state.add_cost(float(getattr(e, "cost_usd", 0.0) or 0.0), int(getattr(e, "tokens", 0) or 0))
 
     async def retry(self, fn: Callable[[], Awaitable[Any]]) -> Any:
         return await with_retry(fn, self.deps.sleep)

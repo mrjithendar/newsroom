@@ -112,11 +112,23 @@ async def test_contract(store: PgNewsStore) -> None:
 
     async with store.pool.connection() as c:
         await c.execute("update news_articles set review_outcome = 'approved' where id = %s", (aid,))
-    assert (await store.training_rows())[0]["features"] == {"recency": 1}
+    tr = (await store.training_rows())[0]
+    assert tr["features"] == {"recency": 1} and tr["job_id"] == job
+    rc = await store.recent_candidates(10)
+    assert rc[0]["run_id"] == rid and rc[0]["job_id"] == job and rc[0]["features"] == {"recency": 1}
+    await store.add_labels([{"item_id": a, "topics": ["kubernetes"], "source": "human"}])
+    lr = (await store.label_rows())[0]
+    assert lr["item_id"] == a and lr["cluster_id"] == cid and lr["source"] == "human"
 
     await store.save_model("ranker", "v1", metrics={"auc": 0.7}, n_samples=10, artifact=b"x", active=True)
     await store.save_model("ranker", "v2", metrics={"auc": 0.8}, n_samples=10, artifact=b"y", active=True)
     assert (await store.active_model("ranker"))["version"] == "v2"  # exactly one active per kind
+    await store.save_model("ranker", "v3", metrics={}, n_samples=10, artifact=None, active=False)
+    assert not await store.activate_model("ranker", "v3")  # no artifact: cannot serve
+    assert await store.activate_model("ranker", "v1")  # rollback
+    assert (await store.active_model("ranker"))["version"] == "v1"
+    models = await store.list_models("ranker")
+    assert {m["version"]: m["active"] for m in models} == {"v1": True, "v2": False, "v3": False} and not next(m for m in models if m["version"] == "v3")["has_artifact"]
 
     prop = await store.add_profile_version("writing", {"key": "news-default", "name": "Default", "system_style": "s", "structure_template": "", "tone": "", "audience": "", "banned_phrases": [], "required_sections": [], "examples": [], "explanation": "e", "created_by": "flow"})
     assert prop["version"] == 2 and prop["status"] == "proposed" and (await store.writing_profile("news-default"))["version"] == 1

@@ -3,6 +3,7 @@ decision and a human-readable reason; the order of the checks below is the order
 
 from __future__ import annotations
 
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +27,8 @@ class Candidate:
     language: str | None = "en"
     site_match: dict[str, Any] | None = None
     covered: bool = False  # drafted/published/selected for this job within the dedupe window
+    threshold: float | None = None  # the score threshold for this candidate's model (v2: mapped from min_score)
+    explored: bool = False  # selected below the threshold by the opt-in exploration (NewsSettings.explore_rate)
     decision: str = "rejected"
     reason: str = ""
     rank: int | None = None
@@ -67,17 +70,29 @@ def _filters(c: Candidate, cfg: JobConfig) -> str | None:
         return f"already covered within {cfg.dedupe_window_days} days"
     if c.site_match and c.site_match.get("update_candidate"):
         return f"an existing article covers this ({c.site_match.get('path')}); suggested as an update instead"
-    if c.score < cfg.min_score:
-        return f"score {c.score:.2f} below the job's threshold {cfg.min_score:.2f}"
+    t = c.threshold if c.threshold is not None else cfg.min_score
+    if c.score < t:
+        return f"score {c.score:.2f} below the job's threshold {t:.2f}" + (f" (min_score {cfg.min_score:.2f} mapped to {c.model_version})" if c.threshold is not None else "")
     return None
 
 
-def select(cands: list[Candidate], cfg: JobConfig, counts: Counts, *, global_cap: int, mode: str = "single_stories") -> list[Candidate]:
-    """Mutates and returns the candidates (sorted by score) with decision/reason/rank set."""
+BELOW_THRESHOLD = "score "
+
+
+def select(cands: list[Candidate], cfg: JobConfig, counts: Counts, *, global_cap: int, mode: str = "single_stories", explore_rate: float = 0.0, rng: random.Random | None = None) -> list[Candidate]:
+    """Mutates and returns the candidates (sorted by score) with decision/reason/rank set.
+
+    explore_rate (opt-in, default 0): each candidate held back *only* by the score threshold becomes eligible with this
+    probability (marked `explored`), so the ranker also gets labels for stories it would not have picked. It still goes
+    through every cap and diversity rule below."""
     cands.sort(key=lambda c: (-c.score, c.cluster_id))
     eligible: list[Candidate] = []
+    r = rng or random.Random()  # noqa: S311 - exploration, not security
     for c in cands:
         why = _filters(c, cfg)
+        if why and explore_rate > 0 and why.startswith(BELOW_THRESHOLD) and r.random() < explore_rate:
+            c.explored = True
+            why = None
         if why:
             c.decision, c.reason = "rejected", why
         else:
@@ -107,7 +122,7 @@ def select(cands: list[Candidate], cfg: JobConfig, counts: Counts, *, global_cap
             continue
         taken += 1
         c.decision, c.rank = "selected", taken
-        c.reason = f"selected: score {c.score:.2f}, rank {taken}"
+        c.reason = f"selected: score {c.score:.2f}, rank {taken}" + (" (exploration: below the threshold)" if c.explored else "")
         per_topic[main_topic] = per_topic.get(main_topic, 0) + 1
         for s in c.source_ids:
             per_source[s] = per_source.get(s, 0) + 1

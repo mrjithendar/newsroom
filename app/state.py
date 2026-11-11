@@ -3,6 +3,10 @@
 A Flow's state is what CrewAI persists after every step (app/runs.py → seo_flow_runs.state_json). Inputs are
 validated against the flow's *Input* model (extra fields refused, bounded sizes) before a run is created, so the API,
 the CronJob trigger and the admin MCP `kickoff_flow` tool all go through the same check.
+
+`feedback` on the drafting inputs is the reviewer's regenerate feedback. When the run was started from the admin MCP
+(`triggered_by="mcp"`), the crews treat it as untrusted data (a data block), never as instructions; the MCP tool also
+refuses a draft that is not new or generation_failed (app/mcp/admin.py).
 """
 
 from __future__ import annotations
@@ -116,7 +120,8 @@ class OptimizeState(RunState):
     recommendation_ids: list[str] = Field(default_factory=list)
     extra: list[dict[str, Any]] = Field(default_factory=list)
     trigger: str = "manual"
-    feedback: str | None = None
+    feedback: str | None = None  # the reviewer's (regenerate) feedback; kept for every attempt of this run
+    validator_feedback: str | None = None  # the validator's errors on the previous attempt (the automatic retry)
     context: dict[str, Any] = Field(default_factory=dict)
     related: list[dict[str, Any]] = Field(default_factory=list)
     plan: dict[str, Any] = Field(default_factory=dict)
@@ -137,7 +142,8 @@ class NewArticleState(RunState):
     draft_id: str = ""
     calendar_id: str = ""
     article_id: str | None = None
-    feedback: str | None = None
+    feedback: str | None = None  # the reviewer's (regenerate) feedback; kept for every attempt of this run
+    validator_feedback: str | None = None  # the validator's errors on the previous attempt (the automatic retry)
     brief: dict[str, Any] = Field(default_factory=dict)
     document: dict[str, Any] | None = None
     crew: dict[str, Any] = Field(default_factory=dict)

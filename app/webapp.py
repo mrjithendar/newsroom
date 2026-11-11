@@ -106,7 +106,9 @@ class HttpWebApp:
         return await self._req("POST", f"/drafts/{draft_id}/status", json={"status": status, "reason": reason})
 
     async def publish(self, draft_id: str, approval_id: str, accepted_change_ids: list[str], edits: dict[str, str] | None = None) -> dict[str, Any]:
-        return await self._req("POST", f"/drafts/{draft_id}/publish", json={"approvalId": approval_id, "acceptedChangeIds": accepted_change_ids, "edits": edits or {}})
+        # Idempotency-Key = the approval id: if a publish commits and its response is lost, the retry gets the earlier
+        # success back instead of a 403 for the now-used approval (services/www/src/lib/seo-intel/publish.ts).
+        return await self._req("POST", f"/drafts/{draft_id}/publish", json={"approvalId": approval_id, "acceptedChangeIds": accepted_change_ids, "edits": edits or {}}, headers={"Idempotency-Key": approval_id})
 
     async def verify(self, draft_id: str, attempt: int, final: bool) -> dict[str, Any]:
         return await self._req("POST", f"/drafts/{draft_id}/verify", json={"attempt": attempt, "final": final})

@@ -22,6 +22,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -37,6 +38,9 @@ ACTIVE = ("queued", "running")
 TERMINAL = ("succeeded", "failed", "cancelled", "paused_budget")
 # Business outcomes that make the run itself "failed" (the draft records the reason; alerts count these).
 FAILED_OUTCOMES = {"generation_failed", "publish_failed", "verify_failed", "report_mismatch", "failed"}
+# The flow run the current task belongs to (set by FlowRunner._drive and SeoFlow.step). Crews copy it into
+# CallSpec.run_id so every model call can be attributed to its run.
+CURRENT_RUN_ID: ContextVar[str | None] = ContextVar("seo_flow_run_id", default=None)
 
 
 def _jsonable(v: Any) -> Any:
@@ -456,6 +460,7 @@ class FlowRunner:
                 await self._finish(run_id, spec.name, "cancelled", None, error="another run for this flow and target holds the lock")
                 return
             await self.store.update(run_id, status="running")
+            CURRENT_RUN_ID.set(run_id)  # this task's context only; CrewAI's step tasks inherit it
             flow = spec.factory(self.deps, self.persistence())
             await asyncio.wait_for(flow.kickoff_async(inputs={**inputs, "id": run_id, "triggered_by": triggered_by}), self.timeout_s)
             st = flow.state
@@ -463,9 +468,12 @@ class FlowRunner:
             status = "paused_budget" if outcome == "paused_budget" else ("failed" if outcome in FAILED_OUTCOMES else "succeeded")
             await self._finish(run_id, spec.name, status, st, error="; ".join(st.errors[-3:])[:1000] if status == "failed" and getattr(st, "errors", None) else None)
         except asyncio.CancelledError:
+            # cancel()/cancel_for_draft: the CancelledError reaches the running step first; a crew in a worker thread
+            # marks its CrewRun cancelled there (crews/common.run_crew), so it stops calling the model.
             await self._finish(run_id, spec.name, "cancelled", flow.state if flow else None, error="cancelled")
             raise
         except TimeoutError:
+            # wait_for cancelled the flow task first (same path as above inside the step), then raised TimeoutError here.
             await self._finish(run_id, spec.name, "failed", flow.state if flow else None, error=f"flow wall-clock limit {self.timeout_s:.0f}s reached")
         except Exception as e:  # a step raised: the run is failed; a rerun starts from the beginning
             log.exception("flow run failed", extra={"event": "flow_failed", "flow": spec.name})

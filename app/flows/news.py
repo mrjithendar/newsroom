@@ -237,7 +237,9 @@ class NewsJobFlow(NewsHelpers, SeoFlow[NewsJobState]):
                 raise BudgetExceeded("news", "an LLM budget cap is already reached")
             ingest_lock: asyncio.Lock = d.extra.setdefault("news_ingest_lock", asyncio.Lock())
             async with ingest_lock:  # ingestion is shared: one at a time; a source fetched within its interval is skipped
-                ing = await nd.ingest(d, rec, source_ids=job.config.source_ids, llm_ok=s.llm and not s.dry_run)
+                # Ingest's Claude topic fallback is shared work: capped by the global news budget, booked to this run.
+                ing_d = nd.with_news_llm(d, [rec.run_id], job=None, dry_run=s.dry_run, enabled=s.llm and not s.dry_run)
+                ing = await nd.ingest(ing_d, rec, source_ids=job.config.source_ids, llm_ok=s.llm and not s.dry_run)
             if s.retry_of:
                 selected = await self._retry_selection(d, rec, job)
             else:
@@ -412,6 +414,12 @@ async def gauges(d: nd.DeskDeps) -> None:
                 since = src.get("last_success_at") or src.get("created_at") or now
                 worst = max(worst, (now - since).total_seconds())
         metrics.NEWS_SOURCE_FAILING_SINCE.set(worst)
+        # The serving models' held-out metrics (restart-safe: read from news_models) and the score drift check.
+        for kind in ("classifier", "ranker"):
+            m = await d.store.active_model(kind)
+            if m:
+                nd.set_model_gauges(kind, m.get("metrics") or {})
+        await nd.drift(d)
     except Exception:  # noqa: S110 - gauges are best effort
         pass
 
@@ -431,7 +439,8 @@ class NewsIngestFlow(NewsHelpers, SeoFlow[NewsIngestState]):
         try:
             lock: asyncio.Lock = d.extra.setdefault("news_ingest_lock", asyncio.Lock())
             async with lock:
-                r = await nd.ingest(d, rec, source_ids=list(s.source_ids) or None, force=s.force, llm_ok=d.news.enabled)
+                ing_d = nd.with_news_llm(d, [rec.run_id], job=None, enabled=d.news.enabled)  # global news caps
+                r = await nd.ingest(ing_d, rec, source_ids=list(s.source_ids) or None, force=s.force, llm_ok=d.news.enabled)
             s.result = {"new": r["new"], "clusters": len(r["clusters"])}
             await self.close_run(d, rec, "succeeded")
             s.outcome = "done"

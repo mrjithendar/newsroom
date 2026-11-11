@@ -37,3 +37,15 @@ def span(name: str, attrs: dict[str, Any] | None = None) -> Iterator[Any]:
             s.record_exception(e)
             s.set_status(trace.Status(trace.StatusCode.ERROR, type(e).__name__))
             raise
+
+
+def emit_span(name: str, *, start_ns: int, attrs: dict[str, Any] | None = None, error: str | None = None) -> None:
+    """A finished span from `start_ns` to now, as a child of the current span (e.g. the flow step's). Used for LLM
+    calls (one `llm.call` span each): a streamed call lives across generator yields, where a context-managed current
+    span (span() above) would be attached in one context and detached in another, so the span is emitted once the call
+    is booked. Numbers stay numeric (Jaeger range queries); None values are dropped."""
+    clean = {k: (v if isinstance(v, (bool, int, float, str)) else str(v)) for k, v in (attrs or {}).items() if v is not None}
+    s = trace.get_tracer("seo-agent").start_span(name, start_time=start_ns, attributes=clean)
+    if error:
+        s.set_status(trace.Status(trace.StatusCode.ERROR, error))
+    s.end()

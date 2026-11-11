@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import difflib
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,13 +31,14 @@ from .crew import NewsDeskCrew
 from .dedupe import Deduper, Sig, minhash_of
 from .feeds import FeedError, parse_feed
 from .images import Brief, GeminiProvider, ImageError, OpenAIProvider, TemplateProvider, build_prompt, clamp_alt, cover_variants
+from .monitoring import NEWS_MODEL_HOLDOUT_AUC, NEWS_MODEL_MACRO_F1, NEWS_TOPIC_ASSIGNMENTS
 from .quality import SourceDoc, run_gates
 from .runlog import RunRecorder
 from .schemas import ImageVerdict, NewsDraft, StyleProposal, TopicLabels
 from .scoring import V1, Features, RankerModel, TrainRow, recency_value, score_v1, severity_value, source_count_value, train_ranker
 from .select import Candidate, select
 from .store import DuplicateArticle, NewsStore
-from .text import clean_text, content_hash, detect_language, entity_set, extract_entities, host_of, normalize_url, simhash, top_terms, url_hash
+from .text import clean_text, content_hash, detect_language, entity_set, extract_entities, host_of, normalize_url, simhash, top_terms, url_hash, words
 
 DEFAULT_PRIMARY_HOSTS = ("github.com", "kubernetes.io", "cncf.io", "aws.amazon.com", "docs.aws.amazon.com", "learn.microsoft.com", "azure.microsoft.com", "cloud.google.com", "developer.hashicorp.com", "hashicorp.com", "nvd.nist.gov", "cisa.gov", "www.cisa.gov", "istio.io", "prometheus.io", "grafana.com", "argo-cd.readthedocs.io", "docs.crewai.com", "modelcontextprotocol.io", "anthropic.com", "docs.anthropic.com", "openai.com")
 
@@ -52,6 +55,17 @@ class DeskDeps:
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
     crew_factory: Callable[[Any], Any] | None = None  # (llm) -> crew with .run(...)
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def with_news_llm(d: DeskDeps, run_ids: list[str], *, job: Job | None = None, dry_run: bool = False, enabled: bool = True) -> DeskDeps:
+    """A copy of the deps whose LLM goes through the news caps and books its cost to the given news runs. Every news LLM
+    call needs this (app/llm.py's BudgetGuard skips news.* purposes): ingest's topic fallback uses the global scope
+    (job=None), drafting the job's."""
+    if isinstance(d.llm, NewsLlm):
+        return d
+    ids = [r for r in run_ids if r]
+    budget = NewsBudget(d.store, d.news, job, ids[0] if ids else "", d.clock, dry_run)
+    return dataclasses.replace(d, llm=NewsLlm(d.llm, budget, ids, enabled=enabled))
 
 
 def as_job(row: dict[str, Any]) -> Job:
@@ -154,12 +168,13 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
             i["embedding"] = [float(x) for x in v]
             await d.store.update_item(str(i["id"]), embedding=i["embedding"])
     old = [i for i in recent if str(i["id"]) not in set(new_ids)]
-    dd = Deduper.from_existing([Sig(str(i["id"]), i["url_hash"], i["content_hash"], i.get("minhash"), i.get("embedding"), i.get("cluster_id"), str(i["source_id"])) for i in old])
-    cl = Clusterer(window_hours=96)
+    dd = Deduper.from_existing([_sig(i, i.get("cluster_id")) for i in old], min_tokens=d.news.near_dup_min_tokens)
+    cl = Clusterer(window_hours=96, max_cves=d.news.cve_roundup_max)
     clusters = await d.store.recent_clusters(now - timedelta(hours=cl.window_hours + 24))
     members = await d.store.items_by_cluster([str(c["id"]) for c in clusters])
     for c in clusters:
         cid = str(c["id"])
+        em = c.get("entities") if isinstance(c.get("entities"), dict) else {}
         cl.clusters[cid] = ClusterState(
             id=cid,
             title=c["title"],
@@ -172,10 +187,12 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
             severity=c.get("severity"),
             exploited=bool((c.get("entities") or {}).get("exploited")) if isinstance(c.get("entities"), dict) else False,
             status=c.get("status", "new"),
+            entity_counts=Counter({str(k): int(v) for k, v in ((em or {}).get("counts") or {}).items()}),
+            cve_counts=Counter({str(k): int(v) for k, v in ((em or {}).get("cve_counts") or {}).items()}),
         )
     touched: set[str] = set()
     for i in fresh:
-        sig = Sig(str(i["id"]), i["url_hash"], i["content_hash"], i.get("minhash"), i.get("embedding"), None, str(i["source_id"]))
+        sig = _sig(i, None)
         res = dd.check(sig)
         at = i.get("published_at") or i.get("fetched_at") or now
         ents = i.get("entities") or {}
@@ -203,13 +220,22 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
     return sorted(touched)
 
 
+def _sig(i: dict[str, Any], cluster_id: str | None) -> Sig:
+    # The MinHash was computed over "title summary" (fetch_sources); the excerpt is that summary, bounded. Full article
+    # text is not fetched at ingest (only for drafting), so it cannot be used here.
+    n = len(words(f"{i.get('title') or ''} {i.get('excerpt') or ''}"))
+    return Sig(str(i["id"]), i["url_hash"], i["content_hash"], i.get("minhash"), i.get("embedding"), cluster_id, str(i["source_id"]), n_tokens=n)
+
+
 def _cluster_row(c: ClusterState, now: datetime, existing: dict[str, Any] | None) -> dict[str, Any]:
+    # Capped by frequency (members naming it), not alphabetically, so a reload keeps the entities that matter.
+    ents, cves = c.top_entities(80), c.top_cves(30)
     return {
         "id": c.id,
         "title": c.title,
         "centroid": [float(x) for x in c.centroid] if c.centroid is not None else None,
-        "entities": {"set": sorted(c.entities)[:80], "exploited": c.exploited},
-        "cve_ids": sorted(c.cve_ids)[:30],
+        "entities": {"set": ents, "counts": {e: int(c.entity_counts.get(e, 1)) for e in ents}, "cve_counts": {e: int(c.cve_counts.get(e, 1)) for e in cves}, "exploited": c.exploited},
+        "cve_ids": cves,
         "severity": c.severity,
         "first_seen": c.first_seen or now,
         "last_seen": c.last_seen or now,
@@ -236,6 +262,16 @@ async def active_classifier(d: DeskDeps) -> clf.TopicModel | None:
         return None
 
 
+def classify_cluster(d: DeskDeps, model: clf.TopicModel | None, topics: list[clf.Topic], items: list[dict[str, Any]], centroid: list[float] | None, text: str) -> clf.Prediction:
+    """Train/serve parity: the model sees the cluster's representative item, featurised exactly as a training row
+    (clf.item_inputs). Keyword rules (no model) read the joined text of the cluster's items."""
+    rep = clf.representative(items, centroid) if model is not None else None
+    if rep is None:
+        return clf.predict(model, topics, embedding=centroid, entities=set(), text=text, threshold=d.news.classifier_threshold)
+    emb, ents, rtext = clf.item_inputs(rep)
+    return clf.predict(model, topics, embedding=emb, entities=ents, text=rtext, threshold=d.news.classifier_threshold)
+
+
 async def classify_and_novelty(d: DeskDeps, rec: RunRecorder, cluster_ids: list[str], *, llm_ok: bool) -> None:
     if not cluster_ids:
         return
@@ -244,6 +280,7 @@ async def classify_and_novelty(d: DeskDeps, rec: RunRecorder, cluster_ids: list[
     items = await d.store.items_by_cluster(cluster_ids)
     pending_llm: list[tuple[str, str]] = []
     rows: dict[str, dict[str, Any]] = {}
+    assigned: dict[str, str] = {}
     for cid in cluster_ids:
         c = await d.store.get_cluster(cid)
         if not c:
@@ -251,22 +288,28 @@ async def classify_and_novelty(d: DeskDeps, rec: RunRecorder, cluster_ids: list[
         rows[cid] = c
         its = items.get(cid, [])
         text = " ".join(_item_text(i) for i in its[:6])
-        ents = set((c.get("entities") or {}).get("set", []))
-        p = clf.predict(model, topics, embedding=c.get("centroid"), entities=ents, text=text, threshold=d.news.classifier_threshold)
+        p = classify_cluster(d, model, topics, its, c.get("centroid"), text)
         if p.method == "low_confidence" and llm_ok:
             pending_llm.append((cid, text[:1500]))
-        method = "model" if p.method in ("model", "low_confidence") else p.method
+        # A kept low-confidence guess (no Claude, or Claude failed or over budget) is labelled distinctly, so the
+        # fallback rate is visible (news_topic_assignments_total{method="model_low_conf"}).
+        method = "model_low_conf" if p.method == "low_confidence" else p.method
         c["topics"] = [{"slug": s, "p": pr, "method": method} for s, pr in p.labels]
+        assigned[cid] = method
         rec.count(f"classified_{p.method}")
     if pending_llm and topics:
         try:
             labels = await claude_labels(d, [t for _, t in pending_llm], topics)
             for (cid, _t), tl in zip(pending_llm, labels, strict=True):
                 if tl:
-                    rows[cid]["topics"] = [{"slug": s, "p": 0.6, "method": "claude"} for s in tl]
+                    # Claude returns labels, not probabilities: the configured NewsSettings.claude_topic_p is recorded.
+                    rows[cid]["topics"] = [{"slug": s, "p": d.news.claude_topic_p, "method": "claude"} for s in tl]
+                    assigned[cid] = "claude"
                     rec.count("classified_claude")
         except (BudgetExceeded, InvalidOutput) as e:
             rec.log("warning", f"classifier fallback to Claude skipped: {str(e)[:200]}; keeping the model's best guess")
+    for m in assigned.values():
+        NEWS_TOPIC_ASSIGNMENTS.labels(method=m).inc()
     for cid, c in rows.items():
         if d.retriever is not None and getattr(d.retriever, "available", True):
             try:
@@ -378,9 +421,12 @@ async def build_candidates(d: DeskDeps, job: Job, covered: set[str], signals: di
         )
         s, breakdown = score_v1(f, weights)
         version = V1
+        threshold: float | None = None
         if ranker is not None:
             p = float(ranker.predict([f.vector()])[0])
-            breakdown = {**breakdown, "model": ranker.version, "v1_score": s, "contributions": ranker.explain(f.vector())}
+            # v2 probabilities are not on v1's scale: the job's min_score is mapped through the model's score quantiles.
+            threshold = ranker.threshold_for(cfg.min_score)
+            breakdown = {**breakdown, "model": ranker.version, "v1_score": s, "contributions": ranker.explain(f.vector()), "threshold": threshold if threshold is not None else cfg.min_score}
             s, version = round(p, 4), ranker.version
         langs = [i.get("language") for i in its if i.get("language")]
         out.append(
@@ -399,6 +445,7 @@ async def build_candidates(d: DeskDeps, job: Job, covered: set[str], signals: di
                 language=max(set(langs), key=langs.count) if langs else None,
                 site_match=sm,
                 covered=cid in covered or c.get("status") in ("drafted", "covered"),
+                threshold=threshold,
             )
         )
     return out
@@ -409,7 +456,7 @@ async def active_ranker(d: DeskDeps) -> RankerModel | None:
     if not m or not m.get("artifact"):
         return None
     try:
-        return RankerModel.from_bytes(m["version"], bytes(m["artifact"]))
+        return RankerModel.from_bytes(m["version"], bytes(m["artifact"]), m.get("metrics"))
     except Exception:
         return None
 
@@ -424,14 +471,14 @@ async def select_for_job(d: DeskDeps, rec: RunRecorder, job: Job, *, dry_run: bo
     async with rec.step("select", len(cands)) as o:
         counts = await d.store.counts_since(job.id, day_start)
         mode = "daily_digest" if job.mode == "daily_digest" else "single_stories"
-        select(cands, job.config, counts, global_cap=d.news.max_drafts_per_day, mode=mode)
+        select(cands, job.config, counts, global_cap=d.news.max_drafts_per_day, mode=mode, explore_rate=d.news.explore_rate)
         if job.mode == "both":
             singles = {c.cluster_id for c in cands if c.decision == "selected"}
             rest = [c for c in cands if c.cluster_id not in singles and c.reason.startswith(("per-run cap", "diversity"))]
             if len(rest) >= 2 and counts.job_today + len(singles) < job.config.max_articles_per_day:
                 for i, c in enumerate(rest[: job.config.digest_size]):
                     c.decision, c.rank, c.reason = "selected", 100 + i, f"selected for the digest (score {c.score:.2f})"
-        await d.store.save_candidates(rec.run_id, job.id, [{"cluster_id": c.cluster_id, "features": c.features, "score": c.score, "breakdown": c.breakdown, "model_version": c.model_version, "decision": c.decision, "reason": c.reason, "rank": c.rank} for c in cands])
+        await d.store.save_candidates(rec.run_id, job.id, [{"cluster_id": c.cluster_id, "features": c.features, "score": c.score, "breakdown": {**c.breakdown, "explored": True} if c.explored else c.breakdown, "model_version": c.model_version, "decision": c.decision, "reason": c.reason, "rank": c.rank} for c in cands])
         for c in cands:
             metrics.NEWS_CANDIDATES.labels(decision=c.decision).inc()
         sel = [c for c in cands if c.decision == "selected"]
@@ -726,38 +773,116 @@ async def train_models(d: DeskDeps, rec: RunRecorder, *, bootstrap: bool = False
         rows = await d.store.label_rows()
         order = [t.slug for t in topics]
         dim = len(next((r["embedding"] for r in rows if r.get("embedding")), []) or [0] * 384)
-        samples = []
-        for r in rows:
-            ents = entity_set({k: v for k, v in (r.get("entities") or {}).items() if k != "meta"})
-            x = clf.featurize(r.get("embedding"), ents, f"{r['title']} {r.get('excerpt') or ''}", topics, dim)
-            samples.append((x, set(r["topics"])))
-        m = clf.train(samples, order, dim, f"clf-{version}") if order else None
-        current = await d.store.active_model("classifier")
-        cur_f1 = ((current or {}).get("metrics") or {}).get("macro_f1") or 0
-        promote = bool(m and (m.metrics.get("macro_f1") or 0) >= cur_f1)
+        inputs = [clf.item_inputs(r) for r in rows]  # the same inputs classify_cluster builds at serving time
+        labels = [set(r["topics"]) for r in rows]
+        samples = [(clf.featurize(e, ents, text, topics, dim), ls) for (e, ents, text), ls in zip(inputs, labels, strict=True)]
+        groups = [str(r.get("cluster_id") or r.get("item_id") or f"row{k}") for k, r in enumerate(rows)]
+        m = clf.train(samples, order, dim, f"clf-{version}", groups=groups, sources=[str(r.get("source") or "") for r in rows]) if order else None
+        promote = False
         if m:
-            await d.store.save_model("classifier", m.version, metrics=m.metrics, n_samples=len(samples), artifact=m.to_bytes(), active=promote, notes="promoted" if promote else "kept the previous model (lower macro F1)")
-            metrics.NEWS_MODEL_AUC.labels(model="classifier").set(float(m.metrics.get("macro_f1") or 0))
+            new_f1 = m.metrics.get("macro_f1")
+            current = await active_classifier(d)
+            if current is None:
+                promote, note = True, "promoted (no serving model)"
+            else:
+                # Both models on the same hold-out rows and topics; the serving one may have trained on some of them,
+                # which favours it, so promotion is conservative. Strict improvement by CLASSIFIER_MIN_GAIN.
+                cur_f1 = clf.macro_f1_on(current, [inputs[i] for i in m.eval_idx], [labels[i] for i in m.eval_idx], topics, m.eval_topics)
+                m.metrics["current"] = {"version": current.version, "macro_f1": cur_f1}
+                promote = new_f1 is not None and (cur_f1 is None or new_f1 > cur_f1 + CLASSIFIER_MIN_GAIN)
+                note = f"promoted: macro F1 {new_f1} vs {cur_f1} for {current.version} on the same hold-out" if promote else f"kept {current.version}: macro F1 {new_f1} vs {cur_f1} on the same hold-out (needs > +{CLASSIFIER_MIN_GAIN})"
+            await d.store.save_model("classifier", m.version, metrics=m.metrics, n_samples=len(samples), artifact=m.to_bytes(), active=promote, notes=note)
+            if promote:
+                set_model_gauges("classifier", m.metrics)
         out["classifier"] = {"trained": bool(m), "promoted": promote, "metrics": m.metrics if m else {"reason": f"{len(samples)} labelled items (needs ≥ 30)"}}
         o["output"] = len(samples)
     async with rec.step("train_ranker") as o:
         rows = await d.store.training_rows()
-        from .config import FEATURES, JobConfig
+        from .config import FEATURES
 
-        trs = []
+        weights_cache: dict[str, dict[str, float] | None] = {}
+
+        async def weights_for(job_id: Any) -> dict[str, float] | None:
+            """The v1 baseline scores each row with its own job's weights (defaults when the job is gone)."""
+            key = str(job_id or "")
+            if key not in weights_cache:
+                row = await d.store.get_job(key) if key else None
+                weights_cache[key] = as_job(row).config.effective_weights() if row else None
+            return weights_cache[key]
+
+        trs, dropped = [], 0
         for r in rows:
+            if r["review_outcome"] == "rejected" and r.get("reject_category") in WRITING_REJECTS:
+                dropped += 1  # rejected for how it was written, not for which story it was: no ranking signal
+                continue
             f = r.get("features") or {}
             label = 1 if r["review_outcome"] in ("approved", "scheduled") else 0
-            trs.append(TrainRow(r["run_id"], r["at"], [float(f.get(k, 0)) for k in FEATURES], label))
+            trs.append(TrainRow(r["run_id"], r["at"], [float(f.get(k, 0)) for k in FEATURES], label, await weights_for(r.get("job_id"))))
         if len(trs) < d.news.ranker_min_feedback:
-            out["ranker"] = {"trained": False, "reason": f"{len(trs)} labelled decisions (needs {d.news.ranker_min_feedback})"}
+            out["ranker"] = {"trained": False, "reason": f"{len(trs)} labelled decisions (needs {d.news.ranker_min_feedback})", "dropped_writing_rejects": dropped}
         else:
-            model, report = train_ranker(trs, JobConfig().effective_weights(), f"lgbm-{version}")
+            reference = [TrainRow(str(k["run_id"]), k["created_at"], [float((k.get("features") or {}).get(f, 0)) for f in FEATURES], 0, await weights_for(k.get("job_id"))) for k in await d.store.recent_candidates(5000)]
+            model, report = train_ranker(trs, JobConfig().effective_weights(), f"lgbm-{version}", current=await active_ranker(d), reference=reference or None)
+            report["dropped_writing_rejects"] = dropped
             await d.store.save_model("ranker", f"lgbm-{version}", metrics=report, n_samples=len(trs), artifact=model.to_bytes() if model else None, active=bool(model), notes=report.get("reason"))
             if model:
-                metrics.NEWS_MODEL_AUC.labels(model="ranker").set(float(report["v2"]["auc"]))
+                set_model_gauges("ranker", report)
             out["ranker"] = {"trained": True, **report}
         o["output"] = len(trs)
+    return out
+
+
+CLASSIFIER_MIN_GAIN = 0.005  # a new classifier must beat the serving one by more than this macro F1 on the same rows
+# Reviewer reject categories (news_articles.reject_category) that judge the writing, not the story choice.
+WRITING_REJECTS = frozenset({"style", "inaccurate"})
+
+
+def set_model_gauges(kind: str, m: dict[str, Any]) -> None:
+    """The serving model's held-out metric. news_model_auc keeps its old meaning for the dashboard (ranker AUC,
+    classifier macro F1); news_model_macro_f1 / news_model_holdout_auc are the correctly named copies."""
+    if kind == "classifier":
+        f1 = float(m.get("macro_f1") or 0)
+        metrics.NEWS_MODEL_AUC.labels(model="classifier").set(f1)
+        NEWS_MODEL_MACRO_F1.labels(model="classifier").set(f1)
+    else:
+        auc = float((m.get("v2") or {}).get("auc") or 0)
+        metrics.NEWS_MODEL_AUC.labels(model="ranker").set(auc)
+        NEWS_MODEL_HOLDOUT_AUC.labels(model="ranker").set(auc)
+
+
+async def activate_model_version(d: DeskDeps, kind: str, version: str) -> dict[str, Any]:
+    """Roll back (or forward) to a stored model version; the gauges follow the newly serving model."""
+    if not await d.store.activate_model(kind, version):
+        raise ValueError(f"no stored {kind} model {version} with an artifact")
+    m = await d.store.active_model(kind) or {}
+    set_model_gauges(kind, m.get("metrics") or {})
+    return {"kind": kind, "version": m.get("version"), "metrics": m.get("metrics")}
+
+
+async def drift(d: DeskDeps, runs: int = 10) -> dict[str, float | None]:
+    """PSI of the serving models' scores over recent runs vs their training rows (monitoring.psi; > 0.25 is drift).
+    Ranker: candidate scores of the last `runs` job runs scored by the serving version. Classifier: the top topic
+    probability of recently classified clusters (method model / model_low_conf)."""
+    from .monitoring import NEWS_MODEL_SCORE_PSI, histogram, psi
+
+    out: dict[str, float | None] = {}
+    rk = await d.store.active_model("ranker")
+    if rk:
+        cands = [c for c in await d.store.recent_candidates(5000) if c.get("model_version") == rk["version"]]
+        recent_runs = list(dict.fromkeys(str(c["run_id"]) for c in cands))[:runs]
+        scores = [float(c["score"]) for c in cands if str(c["run_id"]) in set(recent_runs)]
+        out["ranker"] = psi((rk.get("metrics") or {}).get("score_hist") or [], histogram(scores))
+    cm = await d.store.active_model("classifier")
+    if cm:
+        confs = []
+        for c in await d.store.recent_clusters(d.clock() - timedelta(days=7)):
+            ps = [float(t.get("p", 0)) for t in (c.get("topics") or []) if isinstance(t, dict) and str(t.get("method", "")).startswith("model")]
+            if ps:
+                confs.append(max(ps))
+        out["classifier"] = psi((cm.get("metrics") or {}).get("confidence_hist") or [], histogram(confs))
+    for k, v in out.items():
+        if v is not None:
+            NEWS_MODEL_SCORE_PSI.labels(model=k).set(v)
     return out
 
 

@@ -1,7 +1,8 @@
 """Deduplication in three levels (docs/news/ML.md "Dedupe"):
 
 1. exact: the same normalised URL (from any source) or the same content hash (title + text, normalised);
-2. near-duplicate: MinHash LSH over word 5-gram shingles (datasketch), confirmed by the estimated Jaccard;
+2. near-duplicate: MinHash LSH over word 5-gram shingles (datasketch), confirmed by the estimated Jaccard; skipped for
+   texts shorter than `min_tokens` words (a title plus a one-line summary has too few shingles for a stable estimate);
 3. semantic: embedding cosine above a high threshold (a syndicated or lightly reworded copy of the same text).
 
 A duplicate is stored (so source health and "seen" counts stay honest) with `duplicate_of` + `dedupe_reason`, and it
@@ -18,7 +19,7 @@ import numpy as np
 
 from .text import shingles
 
-NUM_PERM = 64
+NUM_PERM = 64  # fixed: stored signatures (news_items.minhash) have exactly this many values
 # datasketch ≥ 2.0 needs the scheme named whenever a MinHash is rebuilt from stored values; changing it invalidates
 # every stored signature (news_items.minhash), so it is fixed here.
 SCHEME = "affine32"
@@ -49,6 +50,7 @@ class Sig:
     embedding: list[float] | None = None
     cluster_id: str | None = None
     source_id: str | None = None
+    n_tokens: int | None = None  # words in the hashed text; None = unknown (MinHash is then always used)
 
 
 @dataclass
@@ -62,12 +64,14 @@ class DedupeResult:
 class Deduper:
     near_threshold: float = 0.8
     semantic_threshold: float = 0.95
+    min_tokens: int = 30
     by_url: dict[str, str] = field(default_factory=dict)
     by_hash: dict[str, str] = field(default_factory=dict)
     sigs: dict[str, Sig] = field(default_factory=dict)
     _lsh: Any = None
     _emb_ids: list[str] = field(default_factory=list)
     _emb: list[np.ndarray] = field(default_factory=list)
+    _emb_mat: np.ndarray | None = None  # stacked _emb, rebuilt lazily after add()
 
     def __post_init__(self) -> None:
         from datasketch import MinHashLSH
@@ -77,8 +81,8 @@ class Deduper:
         self._lsh = MinHashLSH(threshold=max(0.3, self.near_threshold - 0.3), num_perm=NUM_PERM)
 
     @classmethod
-    def from_existing(cls, existing: list[Sig], near_threshold: float = 0.8, semantic_threshold: float = 0.95) -> Deduper:
-        d = cls(near_threshold=near_threshold, semantic_threshold=semantic_threshold)
+    def from_existing(cls, existing: list[Sig], near_threshold: float = 0.8, semantic_threshold: float = 0.95, min_tokens: int = 30) -> Deduper:
+        d = cls(near_threshold=near_threshold, semantic_threshold=semantic_threshold, min_tokens=min_tokens)
         for s in existing:
             d.add(s)
         return d
@@ -87,7 +91,7 @@ class Deduper:
         self.sigs[s.id] = s
         self.by_url.setdefault(s.url_hash, s.id)
         self.by_hash.setdefault(s.content_hash, s.id)
-        if s.minhash and s.id not in self._lsh:
+        if self._use_minhash(s) and s.minhash and s.id not in self._lsh:
             self._lsh.insert(s.id, _minhash(s.minhash))
         if s.embedding:
             v = np.asarray(s.embedding, dtype=np.float32)
@@ -95,13 +99,22 @@ class Deduper:
             if n > 0:
                 self._emb_ids.append(s.id)
                 self._emb.append(v / n)
+                self._emb_mat = None
+
+    def _use_minhash(self, s: Sig) -> bool:
+        return s.n_tokens is None or s.n_tokens >= self.min_tokens
+
+    def _matrix(self) -> np.ndarray:
+        if self._emb_mat is None or len(self._emb_mat) != len(self._emb):
+            self._emb_mat = np.stack(self._emb)
+        return self._emb_mat
 
     def check(self, s: Sig) -> DedupeResult:
         if s.url_hash in self.by_url and self.by_url[s.url_hash] != s.id:
             return DedupeResult("exact", self.by_url[s.url_hash], 1.0)
         if s.content_hash in self.by_hash and self.by_hash[s.content_hash] != s.id:
             return DedupeResult("exact", self.by_hash[s.content_hash], 1.0)
-        if s.minhash:
+        if s.minhash and self._use_minhash(s):
             mh = _minhash(s.minhash)
             best, best_j = None, 0.0
             for other in self._lsh.query(mh):
@@ -117,7 +130,7 @@ class Deduper:
             v = np.asarray(s.embedding, dtype=np.float32)
             n = float(np.linalg.norm(v))
             if n > 0:
-                sims = np.stack(self._emb) @ (v / n)
+                sims = self._matrix() @ (v / n)
                 i = int(np.argmax(sims))
                 if float(sims[i]) >= self.semantic_threshold and self._emb_ids[i] != s.id:
                     return DedupeResult("semantic", self._emb_ids[i], round(float(sims[i]), 4))

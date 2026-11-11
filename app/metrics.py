@@ -123,3 +123,13 @@ NEWS_QUALITY_FAILURE_RATIO = Gauge("news_quality_failure_ratio_7d", "Share of dr
 
 def one_of(value: str, allowed: set[str]) -> str:
     return value if value in allowed else "other"
+
+
+# --- LLM call outcomes and reindex reuse (docs/seo/RAG.md). `outcome` ∈ LLM_OUTCOMES.
+LLM_OUTCOMES = {"ok", "invalid", "truncated", "refused", "cancelled"}
+LLM_CALLS = Counter("seo_llm_calls_total", "LLM calls booked, by outcome (truncated = stop_reason max_tokens; cancelled = stream closed early).", ["purpose", "outcome"], registry=REGISTRY)
+REINDEX_REUSED = Counter("seo_embeddings_reindex_reused_total", "Chunks whose stored embedding was reused (same text, moved within the article).", registry=REGISTRY)
+
+
+def llm_outcome_label(outcome: str) -> str:
+    return one_of(outcome, LLM_OUTCOMES)

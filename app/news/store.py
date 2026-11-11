@@ -88,6 +88,9 @@ class NewsStore(Protocol):
     async def add_labels(self, rows: list[dict[str, Any]]) -> None: ...
     async def save_model(self, kind: str, version: str, *, metrics: dict[str, Any], n_samples: int, artifact: bytes | None, active: bool, notes: str | None = None) -> None: ...
     async def active_model(self, kind: str) -> dict[str, Any] | None: ...
+    async def list_models(self, kind: str | None, limit: int = 20) -> list[dict[str, Any]]: ...
+    async def activate_model(self, kind: str, version: str) -> bool: ...
+    async def recent_candidates(self, limit: int) -> list[dict[str, Any]]: ...
     async def edited_articles(self, since: datetime, limit: int) -> list[dict[str, Any]]: ...
     async def add_feedback(self, row: dict[str, Any]) -> None: ...
     async def prune(self, log_days: int, item_days: int, now: datetime) -> dict[str, int]: ...
@@ -205,7 +208,7 @@ class PgNewsStore:
         if not cluster_ids:
             return {}
         rows = await self._all(
-            """select i.id, i.cluster_id, i.source_id, i.url, i.title, i.published_at, i.fetched_at, i.excerpt, i.clean_text, i.entities, i.language, i.duplicate_of,
+            """select i.id, i.cluster_id, i.source_id, i.url, i.title, i.published_at, i.fetched_at, i.excerpt, i.clean_text, i.entities, i.language, i.duplicate_of, i.embedding,
                       s.name as source_name, s.credibility, s.url as source_url, s.type as source_type
                from news_items i join news_sources s on s.id = i.source_id where i.cluster_id::text = any(%s) order by i.fetched_at""",
             (cluster_ids,),
@@ -293,6 +296,12 @@ class PgNewsStore:
 
     async def candidates(self, run_id: str) -> list[dict[str, Any]]:
         return await self._all("select * from news_candidates where run_id::text = %s order by score desc", (run_id,))
+
+    async def recent_candidates(self, limit: int) -> list[dict[str, Any]]:
+        return await self._all(
+            "select run_id::text as run_id, job_id::text as job_id, features, score, model_version, decision, created_at from news_candidates order by created_at desc, id desc limit %s",
+            (limit,),
+        )
 
     async def covered_clusters(self, job_id: str, since: datetime) -> set[str]:
         rows = await self._all(
@@ -382,7 +391,7 @@ class PgNewsStore:
 
     async def training_rows(self) -> list[dict[str, Any]]:
         return await self._all(
-            """select k.run_id::text as run_id, k.created_at as at, k.features, a.review_outcome, a.reject_category,
+            """select k.run_id::text as run_id, k.job_id::text as job_id, k.created_at as at, k.features, a.review_outcome, a.reject_category,
                       (select max((f.payload->>'clicks')::float8) from news_feedback f where f.article_id = a.id and f.kind = 'performance') as clicks
                from news_articles a join news_candidates k on k.run_id = a.run_id and k.cluster_id = a.cluster_id
                where a.review_outcome is not null"""
@@ -390,7 +399,7 @@ class PgNewsStore:
 
     async def label_rows(self) -> list[dict[str, Any]]:
         return await self._all(
-            """select distinct on (coalesce(l.item_id, l.cluster_id)) l.topics, l.source, i.title, i.clean_text, i.excerpt, i.embedding, i.entities
+            """select distinct on (coalesce(l.item_id, l.cluster_id)) l.topics, l.source, i.id::text as item_id, i.cluster_id::text as cluster_id, i.title, i.clean_text, i.excerpt, i.embedding, i.entities
                from news_labels l join news_items i on i.id = l.item_id order by coalesce(l.item_id, l.cluster_id), (l.source = 'human') desc, l.at desc"""
         )
 
@@ -415,6 +424,22 @@ class PgNewsStore:
 
     async def active_model(self, kind: str) -> dict[str, Any] | None:
         return await self._one("select version, artifact, metrics, trained_at from news_models where kind = %s and active", (kind,))
+
+    async def list_models(self, kind: str | None, limit: int = 20) -> list[dict[str, Any]]:
+        return await self._all(
+            "select kind, version, active, metrics, n_samples, notes, trained_at, artifact is not null as has_artifact from news_models where (%s::text is null or kind = %s) order by trained_at desc limit %s",
+            (kind, kind, limit),
+        )
+
+    async def activate_model(self, kind: str, version: str) -> bool:
+        """Rollback: make a stored version (with an artifact) the one active model of its kind, in one transaction."""
+        async with self.pool.connection() as c, c.transaction():
+            cur = await c.execute("select 1 from news_models where kind = %s and version = %s and artifact is not null", (kind, version))
+            if await cur.fetchone() is None:
+                return False
+            await c.execute("update news_models set active = false where kind = %s and active", (kind,))
+            await c.execute("update news_models set active = true where kind = %s and version = %s", (kind, version))
+            return True
 
     async def edited_articles(self, since: datetime, limit: int) -> list[dict[str, Any]]:
         return await self._all(
@@ -627,6 +652,9 @@ class MemoryNewsStore:
     async def candidates(self, run_id: str) -> list[dict[str, Any]]:
         return sorted((dict(c) for c in self.cand_rows if c["run_id"] == run_id), key=lambda c: -c["score"])
 
+    async def recent_candidates(self, limit: int) -> list[dict[str, Any]]:
+        return [dict(c) for c in reversed(self.cand_rows)][:limit]
+
     async def covered_clusters(self, job_id: str, since: datetime) -> set[str]:
         out = set()
         for a in self.articles.values():
@@ -698,7 +726,7 @@ class MemoryNewsStore:
             k = next((c for c in self.cand_rows if c["run_id"] == a.get("run_id") and c["cluster_id"] == a.get("cluster_id")), None)
             if k:
                 clicks = max([float(f["payload"].get("clicks", 0)) for f in self.feedback if f.get("article_id") == a["id"] and f["kind"] == "performance"] or [0.0])
-                out.append({"run_id": k["run_id"], "at": k["created_at"], "features": k["features"], "review_outcome": a["review_outcome"], "reject_category": a.get("reject_category"), "clicks": clicks or None})
+                out.append({"run_id": k["run_id"], "job_id": k.get("job_id"), "at": k["created_at"], "features": k["features"], "review_outcome": a["review_outcome"], "reject_category": a.get("reject_category"), "clicks": clicks or None})
         return out
 
     async def label_rows(self) -> list[dict[str, Any]]:
@@ -711,7 +739,7 @@ class MemoryNewsStore:
         for key, lb in best.items():
             i = self.items.get(key)
             if i:
-                out.append({"topics": lb["topics"], "source": lb["source"], "title": i["title"], "clean_text": i.get("clean_text", ""), "excerpt": i.get("excerpt", ""), "embedding": i.get("embedding"), "entities": i.get("entities", {})})
+                out.append({"topics": lb["topics"], "source": lb["source"], "item_id": key, "cluster_id": i.get("cluster_id"), "title": i["title"], "clean_text": i.get("clean_text", ""), "excerpt": i.get("excerpt", ""), "embedding": i.get("embedding"), "entities": i.get("entities", {})})
         return out
 
     async def unlabeled_items(self, limit: int) -> list[dict[str, Any]]:
@@ -731,6 +759,19 @@ class MemoryNewsStore:
 
     async def active_model(self, kind: str) -> dict[str, Any] | None:
         return next((dict(m) for m in reversed(self.models) if m["kind"] == kind and m["active"]), None)
+
+    async def list_models(self, kind: str | None, limit: int = 20) -> list[dict[str, Any]]:
+        rows = [{**{k: v for k, v in m.items() if k != "artifact"}, "has_artifact": m.get("artifact") is not None} for m in reversed(self.models) if kind is None or m["kind"] == kind]
+        return rows[:limit]
+
+    async def activate_model(self, kind: str, version: str) -> bool:
+        target = next((m for m in self.models if m["kind"] == kind and m["version"] == version and m.get("artifact") is not None), None)
+        if target is None:
+            return False
+        for m in self.models:
+            if m["kind"] == kind:
+                m["active"] = m is target
+        return True
 
     async def edited_articles(self, since: datetime, limit: int) -> list[dict[str, Any]]:
         out = []

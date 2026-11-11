@@ -3,7 +3,9 @@
 Each new (non-duplicate) item joins the most similar open cluster when, within the cluster's time window,
   cosine(item, centroid) ≥ join_cosine, or
   cosine ≥ entity_cosine and entity Jaccard ≥ min_entity_overlap (shared products / orgs / CVE ids), or
-  they share a CVE id (the same advisory reported by several sources);
+  they share CVE ids (the same advisory reported by several sources): the cluster with the highest CVE Jaccard wins,
+  and an item naming more than `max_cves` CVE ids (a roundup) does not use this rule at all, nor does a cluster that
+  already holds more than `max_cves` (it would attract every advisory it mentions);
 otherwise it starts a new cluster. Centroids are running means (re-normalised). The burst score measures how fast
 coverage is growing across *distinct sources*: sources that joined in the last 12 hours vs the 24 hours before.
 """
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -41,6 +44,15 @@ class ClusterState:
     exploited: bool = False
     status: str = "new"
     dirty: bool = False
+    # How many members named each entity / CVE: saving keeps the most frequent ones when it caps the lists.
+    entity_counts: Counter[str] = field(default_factory=Counter)
+    cve_counts: Counter[str] = field(default_factory=Counter)
+
+    def top_entities(self, n: int) -> list[str]:
+        return _top(self.entities, self.entity_counts, n)
+
+    def top_cves(self, n: int) -> list[str]:
+        return _top(self.cve_ids, self.cve_counts, n)
 
     @property
     def item_count(self) -> int:
@@ -57,6 +69,11 @@ class ClusterState:
         return round(max(0.0, min(1.0, 1 - math.exp(-max(0.0, growth) / 2.5))), 4)
 
 
+def _top(values: set[str], counts: Counter[str], n: int) -> list[str]:
+    """The n most frequent values (ties: alphabetical, so the order is stable)."""
+    return sorted(values, key=lambda v: (-counts.get(v, 1), v))[:n]
+
+
 def _unit(v: list[float] | np.ndarray | None) -> np.ndarray | None:
     if v is None or len(v) == 0:
         return None
@@ -71,21 +88,29 @@ class Clusterer:
     entity_cosine: float = 0.66
     min_entity_overlap: float = 0.34
     window_hours: float = 96
+    max_cves: int = 5
     clusters: dict[str, ClusterState] = field(default_factory=dict)
 
     def best(self, emb: np.ndarray | None, entities: set[str], cves: set[str], at: datetime) -> tuple[ClusterState | None, float]:
         best, best_s = None, 0.0
+        cve_rule = bool(cves) and len(cves) <= self.max_cves
+        cve_best, cve_s = None, 0.0
         for c in self.clusters.values():
             if c.last_seen and at - c.last_seen > timedelta(hours=self.window_hours):
                 continue
-            if cves and cves & c.cve_ids:
-                return c, 1.0
+            if cve_rule and len(c.cve_ids) <= self.max_cves and cves & c.cve_ids:  # a roundup cluster is no CVE magnet
+                j = jaccard(cves, c.cve_ids)
+                if j > cve_s:
+                    cve_best, cve_s = c, j
+                continue
             cos = float(c.centroid @ emb) if (c.centroid is not None and emb is not None) else 0.0
             ent = jaccard(entities, c.entities)
             ok = cos >= self.join_cosine or (cos >= self.entity_cosine and ent >= self.min_entity_overlap)
             s = cos + 0.25 * ent
             if ok and s > best_s:
                 best, best_s = c, s
+        if cve_best is not None:
+            return cve_best, 1.0
         return best, best_s
 
     def assign(self, *, item_id: str, title: str, embedding: list[float] | None, entities: set[str], cves: set[str], source_id: str, at: datetime, severity: float | None = None, exploited: bool = False, force_cluster: str | None = None) -> tuple[str, bool]:
@@ -107,6 +132,8 @@ class Clusterer:
         c.members.append(Member(source_id, at, item_id))
         c.entities |= entities
         c.cve_ids |= cves
+        c.entity_counts.update(entities)
+        c.cve_counts.update(cves)
         if severity is not None:
             c.severity = max(c.severity or 0.0, severity)
         c.exploited = c.exploited or exploited
