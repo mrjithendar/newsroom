@@ -12,6 +12,17 @@ RUN pip install --no-cache-dir "uv==0.13.5"
 COPY pyproject.toml uv.lock ./
 # Exactly the locked versions, production dependencies only.
 RUN uv sync --frozen --no-dev --no-install-project
+# chromadb 1.5.9 (crewai pins ~=1.5.9 and imports it at load; no fixed release exists) ships a Chroma server whose
+# advisories (GHSA-f4j7-r4q5-qw2c, GHSA-2wm9-hf6c-p5cr, GHSA-xph7-9rjv-w5fr, GHSA-36p7-vc44-83pf: code injection
+# through the collections API, missing tenant checks, SimpleRBAC) all need that server running. This service only
+# imports chromadb's client-side types, so the server is removed from the image: the Rust bindings (the `chroma run`
+# server, 50 MB), the Python server, CLI and app, the basic-auth and RBAC providers, and the `chroma` command.
+# docs/seo/DECISIONS.md D-53; tests/test_chromadb_surface.py fails if the service ever imports any of them.
+RUN sp="$(echo /srv/.venv/lib/python3.*/site-packages)" \
+ && rm -rf "$sp/chromadb_rust_bindings" "$sp/chromadb/server" "$sp/chromadb/cli" "$sp/chromadb/app.py" \
+           "$sp/chromadb/auth/basic_authn" "$sp/chromadb/auth/simple_rbac_authz" /srv/.venv/bin/chroma \
+ && CREWAI_TRACING_ENABLED=false /srv/.venv/bin/python -c "import crewai, chromadb.config" \
+ && ! /srv/.venv/bin/python -c "import chromadb.server" 2>/dev/null
 
 ARG MODEL_REPO=BAAI/bge-small-en-v1.5
 ARG MODEL_REV=5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
