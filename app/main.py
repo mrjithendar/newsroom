@@ -36,6 +36,7 @@ from .ask import AskService, MemoryAskLog, PgAskLog
 from .config import Settings, load_settings
 from .crews.editorial import EditorialCrew
 from .crews.optimization import OptimizationCrew
+from .crews.promotion import PromotionCrew
 from .crews.report import ReportCrew
 from .embeddings import HashEmbeddings
 from .flows import SPECS, check_kickoff
@@ -102,6 +103,7 @@ def _crews(deps: Deps) -> None:
     deps.optimization_crew = deps.optimization_crew or (lambda: OptimizationCrew(s, llm, web, ret))
     deps.editorial_crew = deps.editorial_crew or (lambda: EditorialCrew(s, llm, web, ret))
     deps.report_crew = deps.report_crew or (lambda: ReportCrew(s, llm, web, ret))
+    deps.promotion_crew = deps.promotion_crew or (lambda: PromotionCrew(s, llm, web, ret))
 
 
 def _ml(deps: Deps, store: Any, embeddings: Any) -> None:

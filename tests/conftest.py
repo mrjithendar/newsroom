@@ -63,6 +63,11 @@ class FakeWebApp:
     pdfs: dict[str, bytes] = field(default_factory=dict)
     notified: list[str] = field(default_factory=list)
     draft_kind: str = "optimize"
+    promo_enabled: bool = True
+    promo_articles: list[dict[str, Any]] = field(default_factory=list)
+    promo_drafts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    promo_signals: dict[str, Any] = field(default_factory=dict)
+    promo_ideas: list[dict[str, Any]] = field(default_factory=list)
 
     def approve(self, draft_id: str, approval_id: str = "appr-1") -> dict[str, Any]:
         """What the admin approve route does before resuming: record an approval for the accepted changes."""
@@ -211,6 +216,33 @@ class FakeWebApp:
 
     async def cluster_ask_gaps(self) -> dict[str, Any]:
         return {"clustered": 3}
+
+    # --- promotion callbacks --------------------------------------------------------------------------------------
+
+    async def promo_collect(self, article_id: str | None, limit: int | None) -> dict[str, Any]:
+        self.calls.append(("promo_collect", (article_id, limit)))
+        if not self.promo_enabled:
+            return {"enabled": False, "articles": [], "reddit": {"status": "not_configured"}}
+        return {"enabled": True, "articles": self.promo_articles, "reddit": {"status": "not_configured", "message": "Reddit is not configured.", "stored": 0}}
+
+    async def promo_save_drafts(self, article_id: str, posts: list[dict[str, Any]], run_id: str | None) -> dict[str, Any]:
+        self.calls.append(("promo_save_drafts", (article_id, run_id)))
+        self.promo_drafts[article_id] = posts
+        return {"saved": len(posts), "skipped": 0}
+
+    async def promo_idea_signals(self) -> dict[str, Any]:
+        self.calls.append(("promo_idea_signals", None))
+        if not self.promo_enabled:
+            return {"enabled": False, "redditSync": {"status": "not_configured"}}
+        return {"enabled": True, "max": 8, **self.promo_signals, "redditSync": {"status": "connected", "stored": 2}}
+
+    async def promo_save_ideas(self, ideas: list[dict[str, Any]], run_id: str | None) -> dict[str, Any]:
+        self.calls.append(("promo_save_ideas", run_id))
+        # Like the web app: an idea is stored only when its evidence is in the signals it was built from.
+        known = {q["query"] for q in (self.promo_signals.get("gsc") or {}).get("queries", [])} | {t["url"] for t in self.promo_signals.get("reddit", [])}
+        kept = [i for i in ideas if any(e["value"] in known for e in i["evidence"])]
+        self.promo_ideas.extend(kept)
+        return {"saved": len(kept), "skipped": [{"title": i["title"], "reason": "no verified evidence"} for i in ideas if i not in kept]}
 
 
 def sample_report(period: str = "weekly") -> dict[str, Any]:

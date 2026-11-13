@@ -56,6 +56,11 @@ class WebApp(Protocol):
     async def report_notify(self, report_id: str) -> dict[str, Any]: ...
     async def report_pdf(self, report_id: str, pdf: bytes) -> dict[str, Any]: ...
     async def cluster_ask_gaps(self) -> dict[str, Any]: ...
+    # Promotion (services/www/src/lib/seo-agent/callbacks-promotion.ts)
+    async def promo_collect(self, article_id: str | None, limit: int | None) -> dict[str, Any]: ...
+    async def promo_save_drafts(self, article_id: str, posts: list[dict[str, Any]], run_id: str | None) -> dict[str, Any]: ...
+    async def promo_idea_signals(self) -> dict[str, Any]: ...
+    async def promo_save_ideas(self, ideas: list[dict[str, Any]], run_id: str | None) -> dict[str, Any]: ...
     # News desk (services/www/src/lib/news/callbacks.ts)
     async def news_fetch(self, body: dict[str, Any]) -> dict[str, Any]: ...
     async def news_save_draft(self, body: dict[str, Any]) -> dict[str, Any]: ...
@@ -184,6 +189,22 @@ class HttpWebApp:
 
     async def cluster_ask_gaps(self) -> dict[str, Any]:
         return await self._req("POST", "/ask-gaps/cluster", json={})
+
+    # --- promotion ------------------------------------------------------------------------------------------------
+    # The web app reads Reddit (the agent has no internet egress except the Anthropic API), scores channels with its
+    # deterministic rules and stores drafts and ideas for a person to review. Nothing here posts to a channel.
+
+    async def promo_collect(self, article_id: str | None, limit: int | None) -> dict[str, Any]:
+        return await self._req("POST", "/promotion/collect", json={"articleId": article_id, "limit": limit}, timeout=180)
+
+    async def promo_save_drafts(self, article_id: str, posts: list[dict[str, Any]], run_id: str | None) -> dict[str, Any]:
+        return await self._req("POST", f"/promotion/articles/{article_id}/drafts", json={"runId": run_id or None, "posts": posts})
+
+    async def promo_idea_signals(self) -> dict[str, Any]:
+        return await self._req("POST", "/promotion/ideas/signals", json={}, timeout=180)
+
+    async def promo_save_ideas(self, ideas: list[dict[str, Any]], run_id: str | None) -> dict[str, Any]:
+        return await self._req("POST", "/promotion/ideas", json={"runId": run_id or None, "ideas": ideas})
 
     # --- news desk ------------------------------------------------------------------------------------------------
     # The web app fetches (v1 SSRF-safe fetcher, robots.txt, conditional GET), creates the CMS draft post + review draft,

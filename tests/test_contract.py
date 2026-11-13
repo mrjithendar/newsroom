@@ -65,6 +65,11 @@ async def test_every_client_call_hits_a_server_route() -> None:
     await web.report_notify(UUID)
     await web.report_pdf(UUID, b"%PDF-1.4")
     await web.cluster_ask_gaps()
+    # promotion
+    await web.promo_collect(UUID, 3)
+    await web.promo_save_drafts(UUID, [], "run-1")
+    await web.promo_idea_signals()
+    await web.promo_save_ideas([], "run-1")
     # news desk
     await web.news_fetch({"url": "https://e.org/f", "purpose": "feed"})
     await web.news_save_draft({})

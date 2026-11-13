@@ -99,6 +99,12 @@ class ReportInput(_In):
     period: Literal["weekly", "monthly"] = "weekly"
 
 
+class PromotionInput(_In):
+    # one published article (re-score, redraft unedited drafts); omitted = the newest articles without opportunities
+    article_id: str | None = Field(default=None, pattern=UUID)
+    limit: int | None = Field(default=None, ge=1, le=10)
+
+
 # --- States -------------------------------------------------------------------------------------------------------
 
 
@@ -193,3 +199,21 @@ class MlState(RunState):
     suggest_labels: bool = False
     slot: str | None = None
     results: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromotionState(RunState):
+    article_id: str | None = None
+    limit: int | None = None
+    reddit: dict[str, Any] = Field(default_factory=dict)
+    articles: list[dict[str, Any]] = Field(default_factory=list)
+    drafts: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContentIdeasState(RunState):
+    reddit: dict[str, Any] = Field(default_factory=dict)
+    signals: dict[str, Any] = Field(default_factory=dict)
+    ideas: list[dict[str, Any]] = Field(default_factory=list)
+    crew: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)

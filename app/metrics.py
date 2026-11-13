@@ -29,8 +29,10 @@ FLOWS = {
     "news_style_review_flow",
     "news_playground_flow",
     "seo_ml_flow",
+    "promotion_flow",
+    "content_ideas_flow",
 }
-CREWS = {"optimization", "editorial", "report", "news"}
+CREWS = {"optimization", "editorial", "report", "news", "promotion"}
 PURPOSES = {"draft", "regenerate", "crew", "report", "ask_grade", "ask_answer", "classify", "ml_label", "news.crew", "news.classify", "news.vision", "news.style", "news.playground", "other"}
 MCP_SERVERS = {"public", "admin"}
 _BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800)
