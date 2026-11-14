@@ -1,7 +1,7 @@
 """seo-agent settings, from environment variables only (docs/seo/AGENTS.md lists them all).
 
-Secrets (ANTHROPIC_API_KEY, SEO_AGENT_TOKEN, SEO_AGENT_CALLBACK_TOKEN, DATABASE_URL) come from Kubernetes Secrets and
-are never logged, returned by an endpoint or put into a prompt.
+Secrets (ANTHROPIC_API_KEY, SEO_AGENT_TOKEN, SEO_AGENT_CALLBACK_TOKEN, DATABASE_URL, SEO_AGENT_DATABASE_URL) come from
+Kubernetes Secrets and are never logged, returned by an endpoint or put into a prompt.
 """
 
 from __future__ import annotations
@@ -185,7 +185,8 @@ def load_settings() -> Settings:
     env = os.environ
     docs = tuple(h.strip().lower() for h in env.get("SEO_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
     return Settings(
-        database_url=env.get("DATABASE_URL", ""),
+        # Its own, narrower database role when one is configured (scripts/db-role.sql); otherwise the web app's.
+        database_url=env.get("SEO_AGENT_DATABASE_URL", "").strip() or env.get("DATABASE_URL", ""),
         agent_token=env.get("SEO_AGENT_TOKEN", ""),
         callback_token=env.get("SEO_AGENT_CALLBACK_TOKEN", ""),
         callback_url=env.get("SEO_AGENT_CALLBACK_URL", Settings.callback_url).rstrip("/"),
