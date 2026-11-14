@@ -19,7 +19,8 @@ import sys
 
 import httpx
 
-NAME = re.compile(r"^[a-z_]{3,40}_flow$")
+# A flow name: lower-case letters, digits and underscores, starting with a letter (ga4_sync_flow has a digit).
+NAME = re.compile(r"^[a-z][a-z0-9_]{2,39}_flow$")
 
 
 def main(argv: list[str]) -> int:
