@@ -23,6 +23,7 @@ for _k, _v in {
 }.items():
     os.environ.setdefault(_k, _v)
 
+# Official documentation only (the host or a subdomain). Keep equal to services/www/src/lib/seo-agent/config.ts.
 DEFAULT_DOCS_ALLOWLIST = (
     "kubernetes.io",
     "docs.aws.amazon.com",
@@ -30,6 +31,39 @@ DEFAULT_DOCS_ALLOWLIST = (
     "docs.python.org",
     "docs.crewai.com",
     "modelcontextprotocol.io",
+    "minikube.sigs.k8s.io",
+    "helm.sh",
+    "docs.docker.com",
+    "istio.io",
+    "developer.konghq.com",
+    "docs.konghq.com",
+    "argo-cd.readthedocs.io",
+    "karpenter.sh",
+    "keda.sh",
+    "velero.io",
+    "docs.cilium.io",
+    "linkerd.io",
+    "prometheus.io",
+    "grafana.com",
+    "opentelemetry.io",
+    "docs.github.com",
+    "docs.gitlab.com",
+    "docs.ansible.com",
+    "developers.cloudflare.com",
+    "cloud.google.com",
+    "learn.microsoft.com",
+    "www.postgresql.org",
+    "redis.io",
+    "nextjs.org",
+    "react.dev",
+    "nodejs.org",
+    "developer.mozilla.org",
+    "go.dev",
+    "fastapi.tiangolo.com",
+    "docs.pydantic.dev",
+    "docs.claude.com",
+    "platform.claude.com",
+    "docs.langchain.com",
 )
 
 
@@ -78,6 +112,11 @@ class Settings:
     crew_max_rpm: int = 20
     # Per-agent model overrides, "<crew>.<agent>" → model, e.g. {"optimization.analyst": "claude-haiku-5-5"}.
     crew_models: dict[str, str] = field(default_factory=dict)
+    # Per-agent max_iter overrides, "<crew>.<agent>" → turns (1–20), e.g. {"editorial.researcher": 10}; others use
+    # crew_max_iter.
+    crew_max_iters: dict[str, int] = field(default_factory=dict)
+    # Per-request timeout of the Anthropic client. A 16k-token article body on a larger model can take minutes.
+    llm_timeout_s: float = 120.0
     fanout_concurrency: int = 2
     weekly_max_articles: int = 10
     embeddings_provider: str = "onnx"
@@ -128,6 +167,20 @@ def _models(raw: str) -> dict[str, str]:
     return {k: m for k, m in v.items() if isinstance(k, str) and isinstance(m, str) and re.fullmatch(r"[a-z_]+\.[a-z_]+", k) and re.fullmatch(r"claude-[a-z0-9-]{3,40}", m)}
 
 
+def _max_iters(raw: str) -> dict[str, int]:
+    """SEO_CREW_MAX_ITERS: JSON object of "<crew>.<agent>" → max_iter (1–20); anything malformed is ignored."""
+    import json
+    import re
+
+    try:
+        v = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return {}
+    if not isinstance(v, dict):
+        return {}
+    return {k: n for k, n in v.items() if isinstance(k, str) and re.fullmatch(r"[a-z_]+\.[a-z_]+", k) and isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 20}
+
+
 def load_settings() -> Settings:
     env = os.environ
     docs = tuple(h.strip().lower() for h in env.get("SEO_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
@@ -147,6 +200,8 @@ def load_settings() -> Settings:
         crew_max_iter=_int("CREW_MAX_ITER", Settings.crew_max_iter),
         crew_max_rpm=max(1, _int("CREW_MAX_RPM", Settings.crew_max_rpm)),
         crew_models=_models(env.get("SEO_CREW_MODELS", "")),
+        crew_max_iters=_max_iters(env.get("SEO_CREW_MAX_ITERS", "")),
+        llm_timeout_s=max(30.0, min(900.0, _float("SEO_LLM_TIMEOUT_SECONDS", Settings.llm_timeout_s))),
         fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency)),
         weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles),
         embeddings_provider=env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx",

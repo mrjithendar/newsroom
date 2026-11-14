@@ -139,7 +139,7 @@ async def build_container(settings: Settings) -> Container:
     await pool.open(wait=True, timeout=30)
     sync_pool = ConnectionPool(settings.database_url, min_size=1, max_size=2, open=True, kwargs=kw)  # CrewAI persistence
     guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd)
-    llm = AnthropicLlm(settings.anthropic_api_key, guard)
+    llm = AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s)
     web = HttpWebApp(settings.callback_url, settings.callback_token)
     index = PgVectorIndex(pool, make_embeddings(settings))
     reasons: list[str] = []

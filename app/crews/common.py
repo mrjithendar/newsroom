@@ -290,7 +290,7 @@ def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: async
             llm=agent_llm,
             allow_delegation=False,
             allow_code_execution=False,
-            max_iter=settings.crew_max_iter,
+            max_iter=settings.crew_max_iters.get(f"{crew}.{d.key}") or settings.crew_max_iter,
             max_rpm=settings.crew_max_rpm,
             max_execution_time=max(30, settings.crew_timeout_s // 2),
             max_retry_limit=1,
