@@ -57,7 +57,7 @@ async def test_every_client_call_hits_a_server_route() -> None:
     await web.review_queue({"sort": "priority"})
     await web.draft_diff(UUID)
     await web.open_draft_articles(10)
-    for name in ("overview", "traffic-change", "keywords", "page-report", "audit-issues", "llm-usage"):
+    for name in ("overview", "traffic-change", "keywords", "page-report", "audit-issues", "llm-usage", "ai-visibility", "backlinks", "tracked-keywords"):
         await web.data(name, {})
     await web.topics()
     await web.report_generate("weekly")
