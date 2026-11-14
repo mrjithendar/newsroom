@@ -365,9 +365,10 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.post("/ask", dependencies=[Depends(auth)])
     async def ask(body: AskRequest, request: Request) -> Any:
         c = ctr(request)
+        history = [t.model_dump() for t in body.history]
         if body.stream:
-            return StreamingResponse(c.ask.stream(body.question, body.ip_hash), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-        return await c.ask.ask(body.question, body.ip_hash)
+            return StreamingResponse(c.ask.stream(body.question, body.ip_hash, history, body.context_slug), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+        return await c.ask.ask(body.question, body.ip_hash, history=history, context_slug=body.context_slug)
 
     @app.get("/budget", dependencies=[Depends(auth)])
     async def budget(request: Request) -> dict[str, float]:
