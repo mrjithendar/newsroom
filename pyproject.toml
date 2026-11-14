@@ -7,7 +7,7 @@ requires-python = ">=3.13,<3.14"
 # implementation time (2026-11-10). `tool.uv.exclude-newer = "2 weeks"` applies the same rule to every transitive
 # dependency on every re-lock (Dependabot included), so no date needs bumping.
 dependencies = [
-  "crewai==1.15.30",
+  "crewai==1.15.33",
   # Official SDKs, pinned directly (D-54): Claude through the Anthropic SDK behind CrewAI's BaseLLM; MCP servers through
   # the official MCP SDK. crewai requires mcp<2, so 1.30.0 (the newest 1.x) rather than 2.3.0.
   "anthropic==2.3.0",
@@ -23,8 +23,8 @@ dependencies = [
   "tokenizers==0.23.3",
   "numpy==2.5.4",
   "prometheus-client==0.26.0",
-  "opentelemetry-sdk==1.45.1",
-  "opentelemetry-exporter-otlp-proto-http==1.45.1",
+  "opentelemetry-sdk==1.45.2",
+  "opentelemetry-exporter-otlp-proto-http==1.45.2",
   # News desk ML (docs/news/ML.md): CPU-only. scikit-learn (topic classifier, metrics), LightGBM (learned ranker; needs
   # libgomp1 in the image), datasketch (MinHash LSH near-duplicates). Newest releases ≥ 2 weeks old on 2026-11-10.
   "scikit-learn==1.9.1",
@@ -34,10 +34,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "pytest==9.1.1",
+  "pytest==9.2.0",
   "pytest-asyncio==1.4.1",
   "ruff==0.17.3",
-  "mypy==2.4.0",
+  "mypy==2.4.1",
   "testcontainers==4.15.0",
 ]
 
