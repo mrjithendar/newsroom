@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import metrics
 from .ask import AskService, MemoryAskLog, PgAskLog
+from .ask_runtime import PgAskRuntime, StaticAskRuntime
 from .config import Settings, load_settings
 from .crews.editorial import EditorialCrew
 from .crews.optimization import OptimizationCrew
@@ -156,7 +157,8 @@ async def build_container(settings: Settings) -> Container:
     _ml(deps, PgMlStore(pool), index.emb)
     runner = FlowRunner(SPECS, store, PgAdvisoryLocks(settings.database_url), lambda: PgFlowPersistence().bind(sync_pool), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
-    ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s)
+    # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
+    ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
     c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons)
     deps.reindex = c.reindex
     return c
@@ -177,7 +179,7 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     runner = FlowRunner(SPECS, store, MemoryLocks(), lambda: MemoryFlowPersistence().bind(store), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
     guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))
-    ask = AskService(AskPipeline(deps), retriever, MemoryAskLog(), settings.ask_enabled, settings.ask_cache_ttl_s)
+    ask = AskService(AskPipeline(deps), retriever, MemoryAskLog(), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=StaticAskRuntime(), guard=guard)
     c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True)
     deps.reindex = c.reindex
     return c
@@ -240,8 +242,9 @@ async def _gauges(c: Container) -> None:
             st = await c.guard.status()
             if c.settings.monthly_budget_usd > 0:
                 metrics.BUDGET_RATIO.set(st["month_spend_usd"] / c.settings.monthly_budget_usd)
-            if c.settings.ask_daily_budget_usd > 0:
-                metrics.ASK_BUDGET_RATIO.set(st["ask_day_spend_usd"] / c.settings.ask_daily_budget_usd)
+            ask_budget = getattr(c.guard, "ask_daily_usd", c.settings.ask_daily_budget_usd)  # the admin's budget once a question has applied it
+            if ask_budget > 0:
+                metrics.ASK_BUDGET_RATIO.set(st["ask_day_spend_usd"] / ask_budget)
             if c.pool is not None:
                 async with c.pool.connection() as conn:
                     cur = await conn.execute("select count(*)::int as n from seo_drafts where status = 'ready_for_review'")
