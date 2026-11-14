@@ -1,0 +1,36 @@
+"""Process logging: one JSON object per line on stderr.
+
+The format string this replaces only looked like JSON: a quote or a newline in a message broke the line, tracebacks
+were printed as extra plain-text lines, and the fields passed with `extra=` (event, tool, ref, …) were dropped, so the
+reference an MCP client is shown for a failed tool call could not be found in the logs.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any
+
+# Attributes every LogRecord carries. Anything else on a record was passed with `extra=` and is logged as a field.
+_RECORD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {"message", "asctime", "taskName"}
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        out: dict[str, Any] = {"level": record.levelname, "logger": record.name, "msg": record.getMessage()}
+        for key, value in record.__dict__.items():
+            if key not in _RECORD_ATTRS and key not in out:
+                out[key] = value
+        if record.exc_info:
+            out["exc"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            out["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(out, ensure_ascii=False, default=str)
+
+
+def configure_logging() -> None:
+    """Root logger → stderr as JSON lines, at LOG_LEVEL (default INFO). Does nothing if logging is already set up."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), handlers=[handler])

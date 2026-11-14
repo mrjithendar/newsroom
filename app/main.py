@@ -44,6 +44,7 @@ from .flows import SPECS, check_kickoff
 from .flows.base import Deps
 from .index import MemoryRetriever, PgVectorIndex
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
+from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
 from .runs import FlowRunner, MemoryFlowPersistence, MemoryLocks, MemoryRunStore, PgAdvisoryLocks, PgFlowPersistence, PgRunStore, RunError, view
 from .schemas import AskRequest
@@ -401,7 +402,7 @@ async def serve() -> None:
 
 
 def run() -> None:
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format='{"level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
+    configure_logging()
     asyncio.run(serve())
 
 
