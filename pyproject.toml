@@ -7,7 +7,7 @@ requires-python = ">=3.13,<3.14"
 # implementation time (2026-11-10). `tool.uv.exclude-newer = "2 weeks"` applies the same rule to every transitive
 # dependency on every re-lock (Dependabot included), so no date needs bumping.
 dependencies = [
-  "crewai==1.15.33",
+  "crewai==1.15.34",
   # Official SDKs, pinned directly (D-54): Claude through the Anthropic SDK behind CrewAI's BaseLLM; MCP servers through
   # the official MCP SDK. crewai requires mcp<2, so 1.30.0 (the newest 1.x) rather than 2.3.0.
   "anthropic==2.3.0",
