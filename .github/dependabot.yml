@@ -1,5 +1,4 @@
 # Dependabot version updates. Pull requests run `check` in ci.yml; merging one pushes a new seo-agent:latest.
-# Dependabot's pull requests read Dependabot secrets, not Actions secrets: CROSS_REPO_READ_TOKEN must exist in both.
 #
 # Minor and patch updates are grouped to keep the PR count down; majors arrive one PR each.
 # Security updates are not grouped and are not held back by the cooldown.

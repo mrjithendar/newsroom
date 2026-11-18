@@ -4,9 +4,10 @@ name: seo-agent
 #           persistence, advisory-lock and retrieval tests run), pip-audit of the locked production dependencies, and a
 #           Docker build of the image (model checksums verified inside the build) with a smoke test of both ports
 #           (internal API 8080, MCP edge 8090; scripts/smoke-image.sh). The contract tests read moks-cms (its
-#           migrations, callback routes and shared constants; tests/moks_cms.py), so moks-tech/moks-cms master is
-#           checked out next to the code with secret CROSS_REPO_READ_TOKEN. On a merged pull request `check` runs only
-#           the tests: the image is built once, by `release`.
+#           migrations, callback routes and shared constants; tests/moks_cms.py). CI has no moks-cms checkout (no
+#           cross-repository credentials, by choice), so they are skipped here: run them locally with moks-cms checked
+#           out next to this repository. On a merged pull request `check` runs only the tests: the image is built
+#           once, by `release`.
 # release → a merged pull request: build arm64, smoke-test it, push registry.jithendar.com/jithendar/seo-agent:latest.
 #           Then, when repository variable RELEASE_NOTIFY_REPOS lists site repositories, each gets a repository_dispatch
 #           "moks-cms-released" {component: seo-agent, tag: latest} (scripts/notify-sites.sh).
@@ -14,8 +15,6 @@ name: seo-agent
 # moks-tech/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
 #
 # Secrets (repository level: private repositories on GitHub Free cannot read organization secrets):
-#   CROSS_REPO_READ_TOKEN  fine-grained token, Contents: read on moks-tech/moks-cms. Also a Dependabot secret, or
-#                          Dependabot's pull requests cannot check moks-cms out.
 #   HARBOR_USERNAME, HARBOR_PASSWORD  the Harbor robot that pushes to project jithendar.
 #   RELEASE_NOTIFY_TOKEN   fine-grained token, Contents: read and write on the site repositories (optional).
 
@@ -48,26 +47,12 @@ jobs:
     env:
       SEO_AGENT_TEST_DATABASE_URL: postgresql://postgres:ci-only-not-secret@localhost:5432/seo_agent_test
       UV_PYTHON_DOWNLOADS: never
-      # tests/moks_cms.py: a missing checkout here is an error, never a skipped contract test.
-      MOKS_CMS_DIR: ${{ github.workspace }}/.moks-cms
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # A merged pull request is built from its merge commit on the default branch.
           ref: ${{ github.event.action == 'closed' && github.event.pull_request.merge_commit_sha || '' }}
-      - name: Secret CROSS_REPO_READ_TOKEN is set
-        env:
-          TOKEN: ${{ secrets.CROSS_REPO_READ_TOKEN }}
-        run: |
-          [[ -n "$TOKEN" ]] || { echo "::error::Secret CROSS_REPO_READ_TOKEN (Contents: read on moks-tech/moks-cms) is not set; the contract tests need moks-cms."; exit 1; }
-      - name: Check out moks-cms (for the contract tests)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: moks-tech/moks-cms
-          path: .moks-cms
-          token: ${{ secrets.CROSS_REPO_READ_TOKEN }}
-          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
@@ -79,7 +64,7 @@ jobs:
         run: uv run --frozen ruff check app tests
       - name: Types (mypy)
         run: uv run --frozen mypy app
-      - name: Tests (pytest, incl. Postgres + pgvector and the moks-cms contract)
+      - name: Tests (pytest, incl. Postgres + pgvector; the moks-cms contract tests skip without a moks-cms checkout)
         run: uv run --frozen pytest -q -rs
       - name: RAG eval smoke (hashed embeddings; only that it runs; the real run is rag-eval.yml)
         run: uv run --frozen python scripts/rag_eval.py --embeddings hash --configs baseline-v4,token-hybrid --dsn "$SEO_AGENT_TEST_DATABASE_URL" --out "$RUNNER_TEMP/rag-eval"

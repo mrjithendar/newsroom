@@ -27,14 +27,16 @@ uv run pytest -q -rs
 
 Some tests check that the agent and the web app still agree. They read moks-cms's migrations, the callback server's
 route table and a few shared constants. They find moks-cms at `$MOKS_CMS_DIR`, or in `../moks-cms` next to this
-checkout, and are skipped when it's in neither place. The Postgres tests need `SEO_AGENT_TEST_DATABASE_URL`
-(pgvector, PostgreSQL 18) or Docker for testcontainers. The CronJob test reads jithendar.com's
+checkout, and are skipped when it's in neither place. CI has no moks-cms checkout (no cross-repository credentials, by
+choice), so run them locally before merging a change that touches the database, the callback API or shared constants.
+
+The Postgres tests need `SEO_AGENT_TEST_DATABASE_URL` (pgvector, PostgreSQL 18) or Docker for testcontainers. The CronJob test reads jithendar.com's
 `kubernetes/seo-agent-*-triggers.yaml` (`$SEO_AGENT_K8S_DIR` or `../jithendar.com`).
 
 ## CI and release
 
-- `.github/workflows/ci.yml` runs on pull requests. It checks out moks-cms `master` for the contract tests, runs
-  lint, types, tests and pip-audit, then builds the image without pushing it and smoke-tests it.
+- `.github/workflows/ci.yml` runs on pull requests. It runs lint, types, tests (without the moks-cms contract tests)
+  and pip-audit, then builds the image without pushing it and smoke-tests it.
 - When a pull request is merged, it builds the arm64 image once, smoke-tests it and pushes
   `registry.jithendar.com/jithendar/seo-agent:latest`. Then it sends `moks-cms-released` `{component: seo-agent}` to
   the repositories in `RELEASE_NOTIFY_REPOS`. Nothing here deploys: each site restarts the agent itself.
@@ -44,7 +46,6 @@ Repository settings (private repository on GitHub Free, so these are set at repo
 
 | Name | Kind | What |
 |---|---|---|
-| `CROSS_REPO_READ_TOKEN` | Actions and Dependabot secret | Fine-grained token, Contents: read on `moks-tech/moks-cms` |
 | `HARBOR_USERNAME`, `HARBOR_PASSWORD` | Actions secret | The Harbor robot that pushes to project `jithendar` |
 | `RELEASE_NOTIFY_TOKEN` | Actions secret | Fine-grained token, Contents: read and write on the site repositories |
 | `RELEASE_NOTIFY_REPOS` | Actions variable | Space-separated site repositories, e.g. `moks-tech/jithendar.com` |

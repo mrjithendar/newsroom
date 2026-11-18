@@ -6,9 +6,6 @@ __pycache__/
 .venv/
 *.egg-info/
 
-# moks-cms checked out by CI for the contract tests (tests/moks_cms.py)
-/.moks-cms/
-
 # Embedding model downloaded for local runs (the image fetches its own)
 /models/
 

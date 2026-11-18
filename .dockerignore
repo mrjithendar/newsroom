@@ -8,5 +8,4 @@ models
 *.md
 .git
 .github
-.moks-cms
 scripts

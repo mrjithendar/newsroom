@@ -4,10 +4,10 @@ The agent reads and writes the web app's database and calls its callback API, an
 still agree by reading moks-cms source: its migrations, the callback server's route table and a few shared constants.
 moks-cms is a separate repository (moks-tech/moks-cms), found here as
 
-- $MOKS_CMS_DIR, a moks-cms checkout (CI sets it; a wrong path is an error, never a skip), or
+- $MOKS_CMS_DIR, a moks-cms checkout (a wrong path is an error, never a skip), or
 - ../moks-cms, a checkout next to this repository (local development).
 
-With neither, the tests that need it are skipped.
+With neither, the tests that need it are skipped. CI has no moks-cms checkout, so they run only locally.
 """
 
 from __future__ import annotations
