@@ -21,7 +21,7 @@ import asyncio
 import hmac
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -45,6 +45,7 @@ from .flows.base import Deps
 from .index import MemoryRetriever, PgVectorIndex
 from .lance_admin import LanceAdmin, LanceError
 from .lance_admin import from_env as lance_from_env
+from .lance_index import ArticleMirror, fetch_from
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
@@ -107,13 +108,32 @@ class Container:
     reindex_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     bg: list[asyncio.Task[Any]] = field(default_factory=list)
     lance: LanceAdmin = field(default_factory=lambda: lance_from_env(dict(os.environ)))  # /admin/lancedb (D-92)
+    mirror: ArticleMirror | None = None  # the article index copied into LanceDB (D-93; app/lance_index.py)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
             if not getattr(self.index, "available", False) or not hasattr(self.index, "reindex"):
                 return {"articles": 0, "embedded": 0, "unchanged": 0, "deleted": 0}
             articles = await self.deps.web.published_articles()
-            return await self.index.reindex(articles, full=full, only=set(article_ids) if article_ids else None, force=force)
+            stats = await self.index.reindex(articles, full=full, only=set(article_ids) if article_ids else None, force=force)
+            if self.mirror is not None:
+                stats["lancedb_synced"] = int(bool((await self.mirror.after_reindex(stats)).get("synced")))
+            return stats
+
+    async def initial_mirror(self, attempts: int = 30, every_s: float = 60.0, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+        """Fill LanceDB's article_chunks once after startup if it is missing, as soon as storage is configured."""
+        for _ in range(attempts):
+            if self.mirror is None:
+                return
+            async with self.reindex_lock:
+                try:
+                    out = await self.mirror.sync(only_if_missing=True)
+                except Exception as e:  # R2 unreachable: try again later
+                    log.warning("lancedb article index: startup sync failed", extra={"event": "lancedb_index_failed", "error": type(e).__name__})
+                    out = {"synced": False, "reason": "failed"}
+            if out.get("synced") or out.get("reason", "").startswith(("already", "off", "no chunks")):
+                return
+            await sleep(every_s)
 
 
 def _crews(deps: Deps) -> None:
@@ -178,6 +198,7 @@ async def build_container(settings: Settings) -> Container:
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
     c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons)
     c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
+    c.mirror = ArticleMirror(c.lance, fetch_from(pool), enabled=settings.lancedb_article_index)
     deps.reindex = c.reindex
     return c
 
@@ -290,6 +311,8 @@ async def startup(c: Container) -> None:
         log.warning("run recovery failed", extra={"event": "recover_failed"})
     c.ready = True
     c.bg.append(asyncio.create_task(_gauges(c)))
+    if c.mirror is not None:
+        c.bg.append(asyncio.create_task(c.initial_mirror()))
 
 
 def create_app(container: Container | None = None) -> FastAPI:
