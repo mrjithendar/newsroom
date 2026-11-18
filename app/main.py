@@ -49,6 +49,9 @@ from .lance_index import ArticleMirror, fetch_from
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
+from .run_history import MemoryHistorySink, PgHistorySink, RecordingLlm, RunHistory
+from .run_history import install as install_run_log
+from .run_history import uninstall as uninstall_run_log
 from .runs import FlowRunner, MemoryFlowPersistence, MemoryLocks, MemoryRunStore, PgAdvisoryLocks, PgFlowPersistence, PgRunStore, RunError, view
 from .schemas import AskRequest
 from .seo_ml.store import MemoryMlStore, PgMlStore
@@ -109,6 +112,7 @@ class Container:
     bg: list[asyncio.Task[Any]] = field(default_factory=list)
     lance: LanceAdmin = field(default_factory=lambda: lance_from_env(dict(os.environ)))  # /admin/lancedb (D-92)
     mirror: ArticleMirror | None = None  # the article index copied into LanceDB (D-93; app/lance_index.py)
+    history: RunHistory | None = None  # steps, log lines and model calls of every flow run (app/run_history.py)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
@@ -177,8 +181,9 @@ async def build_container(settings: Settings) -> Container:
     await pool.open(wait=True, timeout=30)
     sync_pool = ConnectionPool(settings.database_url, min_size=1, max_size=2, open=True, kwargs=kw)  # CrewAI persistence
     guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd)
-    llm = AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s)
     web = HttpWebApp(settings.callback_url, settings.callback_token)
+    history = RunHistory(PgHistorySink(pool), web.run_history_settings)
+    llm = RecordingLlm(AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s), history)
     index = PgVectorIndex(pool, make_embeddings(settings))
     reasons: list[str] = []
     try:
@@ -188,7 +193,7 @@ async def build_container(settings: Settings) -> Container:
     except Exception as e:
         reasons.append(f"vector index: {type(e).__name__}")
     store = PgRunStore(pool)
-    deps = Deps(settings=settings, llm=llm, web=web, retriever=index, store=store)
+    deps = Deps(settings=settings, llm=llm, web=web, retriever=index, store=store, history=history)
     _crews(deps)
     _news(deps, PgNewsStore(pool), index.emb)
     _ml(deps, PgMlStore(pool), index.emb)
@@ -196,22 +201,26 @@ async def build_container(settings: Settings) -> Container:
     deps.runner = runner
     # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons)
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history)
     c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
     c.mirror = ArticleMirror(c.lance, fetch_from(pool), enabled=settings.lancedb_article_index)
     deps.reindex = c.reindex
     return c
 
 
-def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any = None, verify_delays: tuple[float, ...] = (0, 0, 0), **crews: Any) -> Container:
-    """Everything in memory (tests): fake LLM and web app, in-memory runs/locks/persistence."""
+def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any = None, verify_delays: tuple[float, ...] = (0, 0, 0), history: bool = False, **crews: Any) -> Container:
+    """Everything in memory (tests): fake LLM and web app, in-memory runs/locks/persistence. `history=True` records
+    the run history in a MemoryHistorySink (container.history.sink) and wraps the model with RecordingLlm."""
     retriever = retriever or MemoryRetriever()
     store = MemoryRunStore()
+    run_history = RunHistory(MemoryHistorySink(runs=store.rows), getattr(web, "run_history_settings", None)) if history else None
+    if run_history is not None:
+        llm = RecordingLlm(llm, run_history)
 
     async def no_sleep(_s: float) -> None:
         return None
 
-    deps = Deps(settings=settings, llm=llm, web=web, retriever=retriever, store=store, sleep=no_sleep, verify_delays=verify_delays, **crews)
+    deps = Deps(settings=settings, llm=llm, web=web, retriever=retriever, store=store, sleep=no_sleep, verify_delays=verify_delays, history=run_history, **crews)
     _crews(deps)
     _news(deps, MemoryNewsStore(), HashEmbeddings())
     _ml(deps, MemoryMlStore(), HashEmbeddings())
@@ -219,7 +228,7 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     deps.runner = runner
     guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))
     ask = AskService(AskPipeline(deps), retriever, MemoryAskLog(), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=StaticAskRuntime(), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True)
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True, history=run_history)
     deps.reindex = c.reindex
     return c
 
@@ -311,6 +320,9 @@ async def startup(c: Container) -> None:
         log.warning("run recovery failed", extra={"event": "recover_failed"})
     c.ready = True
     c.bg.append(asyncio.create_task(_gauges(c)))
+    if c.history is not None:  # started here, outside any run, so the writer's own log lines never enter a run's log
+        install_run_log(c.history)
+        c.bg.append(asyncio.create_task(c.history.run_forever()))
     if c.mirror is not None:
         c.bg.append(asyncio.create_task(c.initial_mirror()))
 
@@ -330,6 +342,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         if owned:
             for t in c.bg:
                 t.cancel()
+            await _close_history(c)
             if c.pool is not None:
                 await c.pool.close()
             if c.sync_pool is not None:
@@ -463,8 +476,20 @@ async def serve() -> None:
     finally:
         for t in c.bg:
             t.cancel()
+        await _close_history(c)
         await c.pool.close()
         c.sync_pool.close()
+
+
+async def _close_history(c: Container) -> None:
+    """Shutdown: stop copying records into run logs and write what is still queued."""
+    if c.history is None:
+        return
+    uninstall_run_log()
+    try:
+        await asyncio.wait_for(c.history.close(), 10)
+    except Exception:  # noqa: S110 - best effort at shutdown
+        pass
 
 
 def run() -> None:

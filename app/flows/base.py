@@ -3,7 +3,8 @@
 Every flow is a CrewAI `Flow[State]` with `@start` / `@listen` / `@router` methods. `SeoFlow` adds:
 - `deps` (settings, LLM, web app client, retriever, run store, the runner for child runs, crew factories);
 - `step(name)`: duration histogram, OTel span and the run's `current_step` while the step runs (CrewAI's persistence
-  then records the finished step and the state, app/runs.py);
+  then records the finished step and the state, app/runs.py), and the step's row in the run history (app/run_history.py:
+  the admin run page's step list and the step its log lines belong to);
 - `@persist(INSTANCE_ONLY)` (never CrewAI's default SQLite), no auto-created CrewAI memory, quiet console.
 """
 
@@ -23,6 +24,7 @@ from pydantic import BaseModel, PrivateAttr
 from .. import metrics
 from ..config import Settings
 from ..llm import BudgetExceeded, Llm
+from ..run_history import CURRENT_STEP
 from ..runs import CURRENT_RUN_ID
 from ..tracing import span
 from ..webapp import WebApp, WebAppError
@@ -45,6 +47,7 @@ class Deps:
     report_crew: Callable[[], Any] | None = None
     promotion_crew: Callable[[], Any] | None = None
     reindex: Callable[..., Awaitable[dict[str, int]]] | None = None  # (article_ids, full, force=False)
+    history: Any = None  # RunHistory (app/run_history.py): steps, log lines and model calls for the admin run page
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     verify_delays: tuple[float, ...] = (40.0, 30.0, 60.0)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -96,19 +99,28 @@ class SeoFlow(Flow[S]):
             except Exception:  # noqa: S110 - the run record must never break a flow
                 pass
         token = CURRENT_RUN_ID.set(str(run_id)) if run_id else None  # model calls in this step carry CallSpec.run_id
+        step_token = CURRENT_STEP.set(name)  # this step's log lines (crew threads: RunHistory's per-run map)
+        history = getattr(self.deps, "history", None) if run_id else None
         try:
+            step_id = await history.step_started(str(run_id), name) if history is not None else None
             with span(f"flow.{self.FLOW}.{name}", {"flow": self.FLOW, "step": name, "run_id": run_id or ""}):
                 failed: str | None = None
+                detail: str | None = None
                 try:
                     yield
                 except BaseException as e:
                     failed = type(e).__name__
+                    detail = f"{failed}: {str(e)[:500]}" if str(e) else failed
                     raise
                 finally:
                     seconds = time.monotonic() - started
                     metrics.STEP_DURATION.labels(flow=metrics.flow_label(self.FLOW), step=name).observe(seconds)
                     log.info("flow step finished", extra={"event": "flow_step", "flow": self.FLOW, "step": name, "seconds": round(seconds, 3), "status": "error" if failed else "ok", "error": failed})
+                    if history is not None:
+                        status = "succeeded" if failed is None else ("cancelled" if failed == "CancelledError" else "failed")
+                        await history.step_finished(str(run_id), step_id, name, status, detail, seconds)
         finally:
+            CURRENT_STEP.reset(step_token)
             if token is not None:
                 CURRENT_RUN_ID.reset(token)
 

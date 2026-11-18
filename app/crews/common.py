@@ -386,6 +386,13 @@ class _TaskWatch:
 
     def start(self) -> None:
         self.since_ns, self.since_tokens = time.time_ns(), self.run.tokens
+        self.started(0)
+
+    def started(self, i: int) -> None:
+        """A log line when task i starts (the run page shows which agent is working before its first model call)."""
+        if i < len(self.tasks):
+            agent = self.agent_of(self.tasks[i])
+            log.info(f"crew task started: {self.crew}.{agent}", extra={"event": "crew_task_started", "crew": self.crew, "agent": agent, "task_index": i, "tasks": len(self.tasks), "run_id": self.run.run_id})
 
     @staticmethod
     def agent_of(task: Any) -> str:
@@ -415,6 +422,8 @@ class _TaskWatch:
         self.done = i + 1
         self.completed += 0 if error else 1
         self.since_ns, self.since_tokens = time.time_ns(), self.run.tokens
+        if error is None:
+            self.started(i + 1)
 
     def close_unfinished(self, reason: str) -> None:
         """The task that was running when the crew stopped (limit, error, cancel) gets its span too, marked failed."""

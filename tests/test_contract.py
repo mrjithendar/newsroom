@@ -66,6 +66,7 @@ async def test_every_client_call_hits_a_server_route() -> None:
     await web.report_pdf(UUID, b"%PDF-1.4")
     await web.cluster_ask_gaps()
     await web.agent_skills()
+    await web.run_history_settings()
     # promotion
     await web.promo_collect(UUID, 3)
     await web.promo_save_drafts(UUID, [], "run-1")
