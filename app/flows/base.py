@@ -10,6 +10,7 @@ Every flow is a CrewAI `Flow[State]` with `@start` / `@listen` / `@router` metho
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -25,6 +26,8 @@ from ..llm import BudgetExceeded, Llm
 from ..runs import CURRENT_RUN_ID
 from ..tracing import span
 from ..webapp import WebApp, WebAppError
+
+log = logging.getLogger("seo_agent.flows")
 
 S = TypeVar("S", bound=BaseModel)
 
@@ -95,10 +98,16 @@ class SeoFlow(Flow[S]):
         token = CURRENT_RUN_ID.set(str(run_id)) if run_id else None  # model calls in this step carry CallSpec.run_id
         try:
             with span(f"flow.{self.FLOW}.{name}", {"flow": self.FLOW, "step": name, "run_id": run_id or ""}):
+                failed: str | None = None
                 try:
                     yield
+                except BaseException as e:
+                    failed = type(e).__name__
+                    raise
                 finally:
-                    metrics.STEP_DURATION.labels(flow=metrics.flow_label(self.FLOW), step=name).observe(time.monotonic() - started)
+                    seconds = time.monotonic() - started
+                    metrics.STEP_DURATION.labels(flow=metrics.flow_label(self.FLOW), step=name).observe(seconds)
+                    log.info("flow step finished", extra={"event": "flow_step", "flow": self.FLOW, "step": name, "seconds": round(seconds, 3), "status": "error" if failed else "ok", "error": failed})
         finally:
             if token is not None:
                 CURRENT_RUN_ID.reset(token)

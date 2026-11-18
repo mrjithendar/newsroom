@@ -135,3 +135,25 @@ REINDEX_REUSED = Counter("seo_embeddings_reindex_reused_total", "Chunks whose st
 
 def llm_outcome_label(outcome: str) -> str:
     return one_of(outcome, LLM_OUTCOMES)
+
+
+# --- CrewAI internals (docs/seo/OPERATIONS.md "Observability"): one sample per crew run, task and tool call.
+# `crew` is crew_label(); `agent` is an agent key of that crew (a fixed set, AGENT_KEYS); `tool` is an allowlisted tool.
+AGENT_KEYS = {"analyst", "editor", "reviewer", "researcher", "writer", "seo_editor", "copywriter", "strategist", "fact_checker", "art_director", "agent"}
+TOOL_STATUSES = {"ok", "error", "timeout", "cancelled"}
+CREW_DURATION = Histogram("seo_crew_duration_seconds", "Crew run wall-clock duration, by result.", ["crew", "status"], buckets=_BUCKETS, registry=REGISTRY)
+CREW_TOKENS = Counter("seo_crew_tokens_total", "Tokens spent by crew runs.", ["crew"], registry=REGISTRY)
+CREW_COST = Counter("seo_crew_cost_usd_total", "Estimated cost of crew runs in USD.", ["crew"], registry=REGISTRY)
+TASK_DURATION = Histogram("seo_crew_task_duration_seconds", "Crew task duration (sequential crews: from the previous task's end).", ["crew", "agent"], buckets=_BUCKETS, registry=REGISTRY)
+TOOL_CALLS = Counter("seo_crew_tool_calls_total", "Tool calls made by crew agents, by result.", ["crew", "tool", "status"], registry=REGISTRY)
+TOOL_DURATION = Histogram("seo_crew_tool_duration_seconds", "Tool call duration.", ["crew", "tool"], buckets=_BUCKETS, registry=REGISTRY)
+
+
+def agent_label(agent: str | None) -> str:
+    return one_of(agent or "agent", AGENT_KEYS)
+
+
+def tool_label(tool: str) -> str:
+    from .tools import ALL_TOOLS
+
+    return tool if tool in ALL_TOOLS else "other"

@@ -14,6 +14,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from . import tracing
+
 
 class WebAppError(Exception):
     def __init__(self, status: int, message: str, code: str = "error"):
@@ -87,7 +89,8 @@ class HttpWebApp:
 
     async def _req(self, method: str, path: str, **kw: Any) -> Any:
         try:
-            r = await self.client.request(method, path, **kw)
+            # traceparent: the web app's handling of this call joins the flow run's trace.
+            r = await self.client.request(method, path, headers=tracing.inject(dict(kw.pop("headers", None) or {})), **kw)
         except httpx.HTTPError as e:
             raise WebAppError(0, f"{type(e).__name__}", "unreachable") from e
         if r.status_code >= 400:

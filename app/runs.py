@@ -30,7 +30,7 @@ from typing import Any, Protocol
 from crewai.flow.persistence.base import FlowPersistence
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
-from . import metrics
+from . import metrics, tracing
 
 log = logging.getLogger("seo_agent.runs")
 
@@ -449,8 +449,22 @@ class FlowRunner:
             fields.update(state_json=st, outputs={k: st.get(k) for k in _OUTPUT_KEYS if st.get(k) not in (None, [], {}, "")}, tokens=int(st.get("tokens") or 0), cost_usd=float(st.get("cost_usd") or 0))
         await self.store.update(run_id, **fields)
         metrics.FLOW_RUNS.labels(flow=metrics.flow_label(flow), status=status).inc()
+        outcome = (st or {}).get("outcome")
+        tokens, cost = fields.get("tokens", 0), round(float(fields.get("cost_usd", 0.0)), 6)
+        # The run's root span (_drive) and one log line carry the result, so Jaeger and Loki can be searched by it.
+        tracing.annotate({"flow.status": status, "flow.outcome": outcome, "flow.tokens": tokens, "flow.cost_usd": cost}, error=status if status == "failed" else None)
+        log.info(
+            "flow run finished",
+            extra={"event": "flow_finished", "flow": flow, "run_id": run_id, "status": status, "outcome": outcome, "tokens": tokens, "cost_usd": cost, "error": (error or "")[:300] or None},
+        )
 
     async def _drive(self, spec: FlowSpec, run_id: str, inputs: dict[str, Any], triggered_by: str) -> None:
+        # One root span per run (flow.<name>): its steps, crews, model calls, tool calls and web app calls nest under it.
+        with tracing.span(f"flow.{spec.name}", {"flow": spec.name, "run_id": run_id, "triggered_by": triggered_by, "target_id": spec.target(inputs)}):
+            log.info("flow run started", extra={"event": "flow_started", "flow": spec.name, "run_id": run_id, "triggered_by": triggered_by})
+            await self._drive_run(spec, run_id, inputs, triggered_by)
+
+    async def _drive_run(self, spec: FlowSpec, run_id: str, inputs: dict[str, Any], triggered_by: str) -> None:
         handle = None
         flow = None
         started = time.monotonic()

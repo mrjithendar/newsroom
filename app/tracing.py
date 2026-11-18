@@ -49,3 +49,29 @@ def emit_span(name: str, *, start_ns: int, attrs: dict[str, Any] | None = None, 
     if error:
         s.set_status(trace.Status(trace.StatusCode.ERROR, error))
     s.end()
+
+
+def current_ids() -> tuple[str, str] | None:
+    """(trace_id, span_id) of the current span as hex, for log lines (Loki → Jaeger); None when there is no span."""
+    ctx = trace.get_current_span().get_span_context()
+    if not ctx.is_valid:
+        return None
+    return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
+
+
+def annotate(attrs: dict[str, Any], *, error: str | None = None) -> None:
+    """Set attributes (and an error status) on the current span, e.g. a flow run's result once it is known."""
+    s = trace.get_current_span()
+    for k, v in attrs.items():
+        if v is not None:
+            s.set_attribute(k, v if isinstance(v, (bool, int, float, str)) else str(v))
+    if error:
+        s.set_status(trace.Status(trace.StatusCode.ERROR, error))
+
+
+def inject(headers: dict[str, str]) -> dict[str, str]:
+    """W3C traceparent of the current span into outgoing headers, so the web app's spans join the agent's trace."""
+    from opentelemetry import propagate
+
+    propagate.inject(headers)
+    return headers
