@@ -457,8 +457,14 @@ class FlowRunner:
             "flow run finished",
             extra={"event": "flow_finished", "flow": flow, "run_id": run_id, "status": status, "outcome": outcome, "tokens": tokens, "cost_usd": cost, "error": (error or "")[:300] or None},
         )
+        history = getattr(self.deps, "history", None)
+        if history is not None:  # steps left open end with the run; its last log lines are written now
+            await history.run_finished(run_id, status)
 
     async def _drive(self, spec: FlowSpec, run_id: str, inputs: dict[str, Any], triggered_by: str) -> None:
+        # This task belongs to this run from its first line: a child run started by another flow's step would otherwise
+        # carry the parent's run id here (the task copies the caller's context) and log "started" into the parent's log.
+        CURRENT_RUN_ID.set(run_id)
         # One root span per run (flow.<name>): its steps, crews, model calls, tool calls and web app calls nest under it.
         with tracing.span(f"flow.{spec.name}", {"flow": spec.name, "run_id": run_id, "triggered_by": triggered_by, "target_id": spec.target(inputs)}):
             log.info("flow run started", extra={"event": "flow_started", "flow": spec.name, "run_id": run_id, "triggered_by": triggered_by})

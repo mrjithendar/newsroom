@@ -78,6 +78,11 @@ GRANT SELECT, INSERT, UPDATE ON
   news_articles, news_clusters, news_images, news_models, news_run_steps, news_runs
   TO seo_agent;
 GRANT SELECT, INSERT, UPDATE, DELETE ON news_candidates, news_items TO seo_agent;
+-- Run history for the admin's CrewAI console (app/run_history.py; moks-cms migration 0036): the step list, the log
+-- (append only) and model-call transcripts. The web app's retention job deletes old lines and transcripts.
+GRANT SELECT, INSERT, UPDATE ON seo_flow_run_steps TO seo_agent;
+GRANT INSERT ON seo_flow_run_logs TO seo_agent;
+GRANT SELECT, INSERT ON seo_flow_run_calls TO seo_agent;
 
 -- The search index. The agent creates seo_article_chunks itself (the vector width follows the embedding model),
 -- adds columns to it at start-up and replaces it after a model change, all of which need ownership. Its rows point
