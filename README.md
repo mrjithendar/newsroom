@@ -38,8 +38,8 @@ The Postgres tests need `SEO_AGENT_TEST_DATABASE_URL` (pgvector, PostgreSQL 18) 
 - `.github/workflows/ci.yml` runs on pull requests. It runs lint, types, tests (without the moks-cms contract tests)
   and pip-audit, then builds the image without pushing it and smoke-tests it.
 - When a pull request is merged, it builds the arm64 image once, smoke-tests it and pushes
-  `registry.jithendar.com/jithendar/seo-agent:latest`. Then it sends `moks-cms-released` `{component: seo-agent}` to
-  the repositories in `RELEASE_NOTIFY_REPOS`. Nothing here deploys: each site restarts the agent itself.
+  `registry.jithendar.com/jithendar/seo-agent:latest`. That's all: it tells no site and deploys nothing, so each site
+  pulls and restarts the agent itself.
 - `.github/workflows/rag-eval.yml` is the manual retrieval evaluation with the production embedding model.
 
 Repository settings (private repository on GitHub Free, so these are set at repository level):
@@ -47,5 +47,3 @@ Repository settings (private repository on GitHub Free, so these are set at repo
 | Name | Kind | What |
 |---|---|---|
 | `HARBOR_USERNAME`, `HARBOR_PASSWORD` | Actions secret | The Harbor robot that pushes to project `jithendar` |
-| `RELEASE_NOTIFY_TOKEN` | Actions secret | Fine-grained token, Contents: read and write on the site repositories |
-| `RELEASE_NOTIFY_REPOS` | Actions variable | Space-separated site repositories, e.g. `moks-tech/jithendar.com` |

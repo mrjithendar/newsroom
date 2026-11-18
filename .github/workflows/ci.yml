@@ -9,14 +9,12 @@ name: seo-agent
 #           out next to this repository. On a merged pull request `check` runs only the tests: the image is built
 #           once, by `release`.
 # release → a merged pull request: build arm64, smoke-test it, push registry.jithendar.com/jithendar/seo-agent:latest.
-#           Then, when repository variable RELEASE_NOTIFY_REPOS lists site repositories, each gets a repository_dispatch
-#           "moks-cms-released" {component: seo-agent, tag: latest} (scripts/notify-sites.sh).
+#           Nothing else: no site is told, each site pulls the image itself.
 # Nothing here deploys: the manifests and the rollout live in each site's repository (jithendar.com:
 # moks-tech/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
 #
 # Secrets (repository level: private repositories on GitHub Free cannot read organization secrets):
 #   HARBOR_USERNAME, HARBOR_PASSWORD  the Harbor robot that pushes to project jithendar.
-#   RELEASE_NOTIFY_TOKEN   fine-grained token, Contents: read and write on the site repositories (optional).
 
 on:
   workflow_dispatch:
@@ -139,8 +137,3 @@ jobs:
             echo "- $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
             echo "- pull request #${{ github.event.pull_request.number }}, commit $RELEASE_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Tell the site repositories
-        env:
-          REPOS: ${{ vars.RELEASE_NOTIFY_REPOS }}
-          GH_TOKEN: ${{ secrets.RELEASE_NOTIFY_TOKEN }}
-        run: scripts/notify-sites.sh seo-agent latest "$RELEASE_SHA"
