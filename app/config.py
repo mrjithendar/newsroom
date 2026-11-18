@@ -44,6 +44,7 @@ DEFAULT_DOCS_ALLOWLIST = (
     "docs.cilium.io",
     "linkerd.io",
     "prometheus.io",
+    "prometheus.github.io",
     "grafana.com",
     "opentelemetry.io",
     "docs.github.com",
