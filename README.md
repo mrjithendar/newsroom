@@ -37,9 +37,9 @@ The Postgres tests need `SEO_AGENT_TEST_DATABASE_URL` (pgvector, PostgreSQL 18) 
 
 - `.github/workflows/ci.yml` runs on pull requests. It runs lint, types, tests (without the moks-cms contract tests)
   and pip-audit, then builds the image without pushing it and smoke-tests it.
-- When a pull request is merged, it builds the arm64 image once, smoke-tests it and pushes
-  `registry.jithendar.com/jithendar/seo-agent:latest`. That's all: it tells no site and deploys nothing, so each site
-  pulls and restarts the agent itself.
+- When a pull request is merged, it builds the arm64 image once and smoke-tests it while the tests run again on the
+  merge commit, then pushes `registry.jithendar.com/jithendar/seo-agent:latest` once they pass. That's all: it tells no
+  site and deploys nothing, so each site pulls and restarts the agent itself.
 - `.github/workflows/rag-eval.yml` is the manual retrieval evaluation with the production embedding model.
 
 Repository settings (private repository on GitHub Free, so these are set at repository level):

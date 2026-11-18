@@ -6,9 +6,10 @@ name: seo-agent
 #           (internal API 8080, MCP edge 8090; scripts/smoke-image.sh). The contract tests read moks-cms (its
 #           migrations, callback routes and shared constants; tests/moks_cms.py). CI has no moks-cms checkout (no
 #           cross-repository credentials, by choice), so they are skipped here: run them locally with moks-cms checked
-#           out next to this repository. On a merged pull request `check` runs only the tests: the image is built
-#           once, by `release`.
-# release → a merged pull request: build arm64, smoke-test it, push registry.jithendar.com/jithendar/seo-agent:latest.
+#           out next to this repository. On a merged pull request `check` runs only the tests (on the merge commit):
+#           the image is built once, by `release`.
+# release → a merged pull request: build arm64 and smoke-test it while `check` runs, then push
+#           registry.jithendar.com/jithendar/seo-agent:latest once `check` has passed (scripts/wait-for-jobs.sh).
 #           Nothing else: no site is told, each site pulls the image itself.
 # Nothing here deploys: the manifests and the rollout live in each site's repository (jithendar.com:
 # moks-tech/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
@@ -24,9 +25,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels the run for the commit it replaces. The run for the merge has a group of its
+# own, so it never cancels the pull request's last checks; releases go one at a time through the `release` job's group.
 concurrency:
-  group: seo-agent-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  group: seo-agent-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'closed' && '-closed' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
 
 jobs:
   check:
@@ -87,11 +90,16 @@ jobs:
         if: github.event.action != 'closed'
         run: scripts/smoke-image.sh seo-agent:ci "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
 
+  # Starts with `check` instead of after it: the build and smoke test (~1.5 min) run while the tests do, and the push
+  # waits for `check` to pass.
   release:
-    needs: check
     if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == github.event.repository.default_branch
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    permissions:
+      contents: read
+      # scripts/wait-for-jobs.sh reads this run's `check` job.
+      actions: read
     concurrency:
       group: seo-agent-release
       cancel-in-progress: false
@@ -116,11 +124,14 @@ jobs:
       - name: Build the image
         # Only :latest: sites run :latest and restart the agent on each release.
         run: docker build --platform linux/arm64 --provenance=false -t "$IMAGE" .
-      - name: Image size (summary only; the gate runs on the pull request's amd64 build)
-        run: scripts/image-size.sh "$IMAGE" /dev/null
       # Never push an image that cannot start: this is the image that is pushed, not a rebuild of it.
       - name: Image smoke test
         run: scripts/smoke-image.sh "$IMAGE" "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
+      # Nothing is pushed unless `check` (ruff, mypy, pytest, pip-audit on the merge commit) passed.
+      - name: Wait for check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/wait-for-jobs.sh 1 check
       - name: Log in to Harbor
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
