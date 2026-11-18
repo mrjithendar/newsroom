@@ -72,6 +72,7 @@ class WebApp(Protocol):
     async def news_site_signals(self) -> dict[str, Any]: ...
     async def news_notify(self, body: dict[str, Any]) -> dict[str, Any]: ...
     async def news_collect_performance(self) -> dict[str, Any]: ...
+    async def agent_skills(self) -> list[dict[str, Any]]: ...
 
 
 class HttpWebApp:
@@ -235,6 +236,10 @@ class HttpWebApp:
 
     async def news_site_signals(self) -> dict[str, Any]:
         return await self._req("GET", "/news/site-signals")
+
+    async def agent_skills(self) -> list[dict[str, Any]]:
+        """The enabled agent skills (D-96, app/crews/skills.py), read before every crew run."""
+        return list((await self._req("GET", "/skills")).get("skills") or [])
 
     async def news_notify(self, body: dict[str, Any]) -> dict[str, Any]:
         return await self._req("POST", "/news/notify", json=body)

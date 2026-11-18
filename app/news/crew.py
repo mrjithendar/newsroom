@@ -18,6 +18,7 @@ from typing import Any
 
 from ..config import Settings
 from ..crews.common import AgentDef, CrewRun, build_agents, make_crew, run_crew, task_raw
+from ..crews.skills import news_tags
 from ..tools import data_block
 from .schemas import FactFlag, FactSheet, ImageBrief, NewsDraft
 from .text import normalize_url
@@ -108,7 +109,7 @@ class NewsDeskCrew:
             tasks = [research, analysis, write, check, seo, art]
             return make_crew(agents, tasks, settings), tasks
 
-        o = await run_crew("news", build, settings, ctx)
+        o = await run_crew("news", build, settings, ctx, tags=news_tags(brief, items))
         facts = self._facts(o.tasks[0], ctx)
         draft = self._draft(o.tasks, brief, o.status, o.reason)
         draft = self._check_sources(draft, items, ctx.fetched)

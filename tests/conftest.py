@@ -68,6 +68,8 @@ class FakeWebApp:
     promo_drafts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     promo_signals: dict[str, Any] = field(default_factory=dict)
     promo_ideas: list[dict[str, Any]] = field(default_factory=list)
+    skills: list[dict[str, Any]] = field(default_factory=list)  # GET /skills (D-96); none unless a test sets them
+    skills_error: Exception | None = None
 
     def approve(self, draft_id: str, approval_id: str = "appr-1") -> dict[str, Any]:
         """What the admin approve route does before resuming: record an approval for the accepted changes."""
@@ -192,6 +194,11 @@ class FakeWebApp:
     async def data(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("data", (name, params)))
         return {"name": name, "params": params, "rows": [], "total": 0}
+
+    async def agent_skills(self) -> list[dict[str, Any]]:
+        if self.skills_error is not None:
+            raise self.skills_error
+        return [dict(s) for s in self.skills]
 
     async def topics(self) -> list[dict[str, Any]]:
         return [{"name": "Kubernetes", "slug": "kubernetes", "count": 12, "path": "/blog/category/kubernetes"}]

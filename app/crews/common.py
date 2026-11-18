@@ -18,6 +18,9 @@
 - Cost: tokens and cost of the calls made before a BudgetExceeded travel on `CrewBudgetExceeded`, so the flow adds
   them to the run before it pauses. Every call carries `CallSpec.run_id` and `CallSpec.agent` and gets an OTel span
   `crew.<crew>.<agent>` under the crew span (CrewAI's own tracing stays off: it exports to CrewAI's platform).
+- Skills (D-96, crews/skills.py): `run_crew` reads the enabled agent skills from the web app and `build_agents` gives
+  each agent the ones matching it and the run's tags, as activated CrewAI skills in its system prompt. The skills each
+  agent got are on CrewOutcome.skills, the crew span (crew.skills) and the crew_finished log line.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +45,7 @@ from ..runs import CURRENT_RUN_ID
 from ..tools import ToolContext, ToolSpec, build_tools, data_block
 from ..tracing import annotate as tracing_annotate
 from ..tracing import emit_span, span
+from . import skills as agent_skills
 
 log = logging.getLogger("seo_agent.crews")
 
@@ -98,6 +102,10 @@ class CrewRun:
     otel_ctx: Any = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     inflight: set[concurrent.futures.Future[Any]] = field(default_factory=set)
+    # Agent skills (D-96, crews/skills.py): the enabled skills read for this run, the run's tags, and what each agent got.
+    skills: list[agent_skills.AgentSkill] = field(default_factory=list)
+    tags: frozenset[str] = frozenset()
+    skills_used: dict[str, list[str]] = field(default_factory=dict)
 
     def check(self) -> None:
         if self.cancelled:
@@ -312,11 +320,15 @@ def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: async
         model = (models or {}).get(d.key) or settings.crew_models.get(f"{crew}.{d.key}") or default_model or settings.draft_model
         max_tokens = d.max_tokens or (long_output_tokens(settings) if d.key in LONG_OUTPUT_AGENTS else DEFAULT_MAX_TOKENS)
         agent_llm = LLMClass(model=model, max_tokens=max_tokens).bind(llm, loop, run, draft_id, purpose, prompt_version, agent=d.key)
+        chosen = agent_skills.select(run.skills, crew, d.key, run.tags)
+        if chosen:
+            run.skills_used[d.key] = [s.ref for s in chosen]
         out[d.key] = Agent(
             role=d.role,
             goal=d.goal,
-            backstory=f"{d.backstory}\n\n{UNTRUSTED}",
+            backstory=f"{d.backstory}\n\n{UNTRUSTED}" + (f"\n\n{agent_skills.SKILLS_RULE}" if chosen else ""),
             tools=tools,
+            skills=agent_skills.to_crewai(chosen) or None,
             llm=agent_llm,
             allow_delegation=False,
             allow_code_execution=False,
@@ -346,6 +358,7 @@ class CrewOutcome:
     cost_usd: float
     seconds: float
     tool_calls: list[tuple[str, str]]
+    skills: dict[str, list[str]] = field(default_factory=dict)  # agent → ["name@vN", …] (D-96)
 
 
 class _TaskWatch:
@@ -409,14 +422,18 @@ class _TaskWatch:
             self.close(self.done, error=reason[:200])
 
 
-async def run_crew(name: str, build: Callable[[asyncio.AbstractEventLoop, CrewRun], tuple[Any, list[Any]]], settings: Settings, tools_ctx: ToolContext) -> CrewOutcome:
+async def run_crew(name: str, build: Callable[[asyncio.AbstractEventLoop, CrewRun], tuple[Any, list[Any]]], settings: Settings, tools_ctx: ToolContext, *, tags: Iterable[str] = ()) -> CrewOutcome:
     """Kick off a crew in a worker thread with the token cap and the wall-clock limit. Never raises for a limit:
     returns status=incomplete with the reason. BudgetExceeded is re-raised as CrewBudgetExceeded (with the tokens and
     cost spent so far; the flow pauses the run). A cancelled flow task (CancelledError) cancels the run and re-raises.
     Observability: span crew.<name> with the result, one span per task (_TaskWatch) and tool call, a crew_finished log
-    line, and seo_crew_* metrics."""
+    line, and seo_crew_* metrics.
+    Skills (D-96): the enabled skills are read from the web app first; `tags` (from the run's ML and Search Console
+    signals, crews/skills.py) decide which ones each agent gets in build_agents."""
     loop = asyncio.get_running_loop()
     run = CrewRun(max_tokens=settings.crew_max_tokens_per_run, run_id=CURRENT_RUN_ID.get(), crew=name)
+    run.skills = await agent_skills.fetch(getattr(tools_ctx, "web", None))
+    run.tags = frozenset(tags)
     crew, tasks = build(loop, run)
     watch = _TaskWatch(name, run, list(tasks))
     status, reason, output = "completed", None, None
@@ -429,7 +446,8 @@ async def run_crew(name: str, build: Callable[[asyncio.AbstractEventLoop, CrewRu
         if final != "completed":
             watch.close_unfinished(reason or final)
         tool_calls = len(tools_ctx.calls)
-        attrs = {"crew.status": final, "crew.reason": (reason or "")[:300] or None, "crew.tokens": run.tokens, "crew.cost_usd": cost, "crew.tasks_done": watch.completed, "crew.tasks": len(watch.tasks), "crew.tool_calls": tool_calls}
+        used = sorted({ref for refs in run.skills_used.values() for ref in refs})
+        attrs = {"crew.status": final, "crew.reason": (reason or "")[:300] or None, "crew.tokens": run.tokens, "crew.cost_usd": cost, "crew.tasks_done": watch.completed, "crew.tasks": len(watch.tasks), "crew.tool_calls": tool_calls, "crew.skills": ",".join(used)[:500] or None}
         tracing_annotate(attrs, error=final if final not in ("completed",) else None)
         lbl = metrics.crew_label(name)
         metrics.CREW_RUNS.labels(crew=lbl, status=final).inc()
@@ -438,7 +456,7 @@ async def run_crew(name: str, build: Callable[[asyncio.AbstractEventLoop, CrewRu
         metrics.CREW_COST.labels(crew=lbl).inc(cost)
         log.info(
             "crew run finished",
-            extra={"event": "crew_finished", "crew": name, "status": final, "reason": (reason or "")[:300] or None, "seconds": round(seconds, 3), "tokens": run.tokens, "cost_usd": cost, "tasks_done": watch.completed, "tasks": len(watch.tasks), "tool_calls": tool_calls, "run_id": run.run_id},
+            extra={"event": "crew_finished", "crew": name, "status": final, "reason": (reason or "")[:300] or None, "seconds": round(seconds, 3), "tokens": run.tokens, "cost_usd": cost, "tasks_done": watch.completed, "tasks": len(watch.tasks), "tool_calls": tool_calls, "run_id": run.run_id, "skills": dict(run.skills_used), "skill_tags": sorted(run.tags)},
         )
 
     with span(f"crew.{name}", {"crew": name, "run_id": run.run_id or ""}):
@@ -474,7 +492,7 @@ async def run_crew(name: str, build: Callable[[asyncio.AbstractEventLoop, CrewRu
         finish("budget" if budget is not None else status)
     if budget is not None:
         raise CrewBudgetExceeded(budget, run.tokens, round(run.cost_usd, 6)) from budget
-    return CrewOutcome(output, tasks, status, reason, run.tokens, round(run.cost_usd, 6), time.monotonic() - started, list(tools_ctx.calls))
+    return CrewOutcome(output, tasks, status, reason, run.tokens, round(run.cost_usd, 6), time.monotonic() - started, list(tools_ctx.calls), dict(run.skills_used))
 
 
 def task_raw(task: Any) -> str:
