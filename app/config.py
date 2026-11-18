@@ -64,6 +64,11 @@ DEFAULT_DOCS_ALLOWLIST = (
     "docs.claude.com",
     "platform.claude.com",
     "docs.langchain.com",
+    "man7.org",
+    "www.freedesktop.org",
+    "systemd.io",
+    "docs.kernel.org",
+    "www.gnu.org",
 )
 
 
