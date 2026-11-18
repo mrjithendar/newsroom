@@ -43,6 +43,8 @@ from .embeddings import HashEmbeddings
 from .flows import SPECS, check_kickoff
 from .flows.base import Deps
 from .index import MemoryRetriever, PgVectorIndex
+from .lance_admin import LanceAdmin, LanceError
+from .lance_admin import from_env as lance_from_env
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
@@ -57,6 +59,19 @@ from .webapp import HttpWebApp
 
 log = logging.getLogger("seo_agent")
 VERSION = os.environ.get("GIT_SHA", "dev")
+
+
+class LanceKey(BaseModel):
+    """One row of a LanceDB table, by a scalar key column and its value (/admin/lancedb)."""
+
+    model_config = ConfigDict(extra="forbid")
+    key_column: str = Field(min_length=1, max_length=128)
+    key: str | int | float | bool
+    actor: str | None = Field(default=None, max_length=200)
+
+
+class LanceUpdate(LanceKey):
+    values: dict[str, str | int | float | bool | None] = Field(min_length=1, max_length=50)
 
 
 class Kickoff(BaseModel):
@@ -91,6 +106,7 @@ class Container:
     reasons: list[str] = field(default_factory=list)
     reindex_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     bg: list[asyncio.Task[Any]] = field(default_factory=list)
+    lance: LanceAdmin = field(default_factory=lambda: lance_from_env(dict(os.environ)))  # /admin/lancedb (D-92)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
@@ -161,6 +177,7 @@ async def build_container(settings: Settings) -> Container:
     # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
     c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons)
+    c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
     deps.reindex = c.reindex
     return c
 
@@ -311,6 +328,10 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def run_error(_r: Request, e: RunError) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=e.status)
 
+    @app.exception_handler(LanceError)
+    async def lance_error(_r: Request, e: LanceError) -> JSONResponse:
+        return JSONResponse({"error": str(e)}, status_code=e.status)
+
     @app.exception_handler(ContentError)
     async def content_error(_r: Request, e: ContentError) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -370,6 +391,28 @@ def create_app(container: Container | None = None) -> FastAPI:
         if body.stream:
             return StreamingResponse(c.ask.stream(body.question, body.ip_hash, history, body.context_slug), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
         return await c.ask.ask(body.question, body.ip_hash, history=history, context_slug=body.context_slug)
+
+    # --- LanceDB browser for /admin/lancedb (D-92; app/lance_admin.py). One row per write, scalar columns only. ---
+
+    @app.get("/lancedb", dependencies=[Depends(auth)])
+    async def lance_overview(request: Request) -> dict[str, Any]:
+        return await ctr(request).lance.run("overview")
+
+    @app.get("/lancedb/tables/{name}", dependencies=[Depends(auth)])
+    async def lance_browse(name: str, request: Request, offset: int = 0, limit: int = 25) -> dict[str, Any]:
+        return await ctr(request).lance.run("browse", name, offset, limit)
+
+    @app.post("/lancedb/tables/{name}/row", dependencies=[Depends(auth)])
+    async def lance_row(name: str, body: LanceKey, request: Request) -> dict[str, Any]:
+        return await ctr(request).lance.run("row", name, body.key_column, body.key)
+
+    @app.post("/lancedb/tables/{name}/update", dependencies=[Depends(auth)])
+    async def lance_update(name: str, body: LanceUpdate, request: Request) -> dict[str, Any]:
+        return await ctr(request).lance.run("update", name, body.key_column, body.key, body.values, actor=body.actor)
+
+    @app.post("/lancedb/tables/{name}/delete", dependencies=[Depends(auth)])
+    async def lance_delete(name: str, body: LanceKey, request: Request) -> dict[str, Any]:
+        return await ctr(request).lance.run("delete", name, body.key_column, body.key, actor=body.actor)
 
     @app.get("/budget", dependencies=[Depends(auth)])
     async def budget(request: Request) -> dict[str, float]:

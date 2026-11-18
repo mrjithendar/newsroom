@@ -143,6 +143,10 @@ class HttpWebApp:
     async def calendar_brief(self, calendar_id: str) -> dict[str, Any]:
         return await self._req("GET", f"/calendar/{calendar_id}/brief")
 
+    async def lancedb_storage(self) -> dict[str, Any]:
+        """The R2 connection for LanceDB, from Admin → Storage (D-91). Holds the media bucket's keys: never log it."""
+        return await self._req("GET", "/storage/lancedb")
+
     # --- v4 ---------------------------------------------------------------------------------------------------
 
     async def run_job(self, job_type: str, slot: str | None, trigger: str) -> dict[str, Any]:
