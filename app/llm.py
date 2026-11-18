@@ -30,7 +30,7 @@ from . import metrics, tracing
 
 T = TypeVar("T", bound=BaseModel)
 
-# USD per million tokens; identical to services/www/src/lib/seo-intel/claude.ts (first-party list prices, 2026-10).
+# USD per million tokens; identical to moks-cms/src/lib/seo-intel/claude.ts (first-party list prices, 2026-10).
 PRICES: dict[str, dict[str, float]] = {
     "claude-sonnet-5-5": {"input": 2, "output": 10, "cache_read": 0.2, "cache_write": 2.5},
     "claude-haiku-5-5": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125},

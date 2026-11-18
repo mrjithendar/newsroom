@@ -35,7 +35,7 @@ def safe_queries(queries: list[str]) -> list[str]:
 
 
 def data_block(name: str, content: Any) -> str:
-    """Same as dataBlock() in services/www/src/lib/seo-intel/llm.ts: untrusted content, closing tags neutralised."""
+    """Same as dataBlock() in moks-cms/src/lib/seo-intel/llm.ts: untrusted content, closing tags neutralised."""
     import json
 
     text = redact(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, indent=1))

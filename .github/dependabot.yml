@@ -1,0 +1,48 @@
+# Dependabot version updates. Pull requests run `check` in ci.yml; merging one pushes a new seo-agent:latest.
+# Dependabot's pull requests read Dependabot secrets, not Actions secrets: CROSS_REPO_READ_TOKEN must exist in both.
+#
+# Minor and patch updates are grouped to keep the PR count down; majors arrive one PR each.
+# Security updates are not grouped and are not held back by the cooldown.
+
+version: 2
+
+updates:
+  # pyproject.toml + uv.lock (exact pins). The two-week rule: cooldown 14 days here, and
+  # tool.uv.exclude-newer = "2 weeks" for transitive dependencies on every re-lock.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - python
+    groups:
+      seo-agent-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Actions in .github/workflows (pinned by commit SHA; Dependabot updates the SHA and the comment)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    commit-message:
+      prefix: "deps(ci)"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"

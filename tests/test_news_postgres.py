@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 
 from app.news.store import DuplicateArticle, PgNewsStore
+from tests.moks_cms import www
 
 pytestmark = pytest.mark.postgres
-WWW = Path(__file__).resolve().parents[2] / "www" / "src" / "db"
 BASE = """
 create table category (slug text primary key, label text not null);
 create table setting (key text primary key, value jsonb not null, updated_at timestamptz not null default now(), updated_by text);
@@ -41,7 +41,7 @@ async def store() -> AsyncIterator[PgNewsStore]:
     async with await psycopg.AsyncConnection.connect(url, autocommit=True) as c:
         await c.execute(f"create schema {schema}")
         await c.execute(f"set search_path to {schema}")
-        for s in [*BASE.split(";"), *statements(WWW / "migrations" / "0017_news_desk.sql")]:
+        for s in [*BASE.split(";"), *statements(www("src/db/migrations/0017_news_desk.sql"))]:
             if s.strip():
                 await c.execute(s)
     pool = AsyncConnectionPool(url, min_size=1, max_size=3, open=False, kwargs={"autocommit": True, "row_factory": dict_row, "options": f"-c search_path={schema}"})
@@ -141,11 +141,11 @@ async def test_contract(store: PgNewsStore) -> None:
 
 async def test_rollback_then_up_again(store: PgNewsStore) -> None:
     async with store.pool.connection() as c:
-        for s in statements(WWW / "rollback" / "0017_news_desk.down.sql"):
+        for s in statements(www("src/db/rollback/0017_news_desk.down.sql")):
             await c.execute(s)
         cur = await c.execute("select count(*)::int as n from information_schema.tables where table_schema = current_schema() and table_name like 'news_%%'")
         assert (await cur.fetchone())["n"] == 0
-        for s in statements(WWW / "migrations" / "0017_news_desk.sql"):
+        for s in statements(www("src/db/migrations/0017_news_desk.sql")):
             await c.execute(s)
         cur = await c.execute("select count(*)::int as n from information_schema.tables where table_schema = current_schema() and table_name like 'news_%%'")
         assert (await cur.fetchone())["n"] == 17

@@ -7,19 +7,19 @@ instead of in production.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import httpx
 import pytest
 
 from app.webapp import HttpWebApp
+from tests.moks_cms import www
 
-SERVER = Path(__file__).resolve().parents[2] / "www" / "src" / "lib" / "seo-agent" / "internal-server.ts"
+SERVER = "src/lib/seo-agent/internal-server.ts"
 UUID = "11111111-1111-4111-8111-111111111111"
 
 
 def routes() -> list[tuple[str, re.Pattern[str]]]:
-    src = SERVER.read_text()
+    src = www(SERVER).read_text()
     out = []
     for method, pattern in re.findall(r'\["(GET|POST)", /(\^[^,]+\$)/,', src):
         out.append((method, re.compile(pattern.replace("\\/", "/"))))

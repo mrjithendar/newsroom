@@ -22,10 +22,12 @@ from typing import Any
 
 import pytest
 
+from tests.moks_cms import www
+
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
 SCRIPT = ROOT / "scripts" / "db-role.sql"
-MIGRATIONS = ROOT.parent / "www" / "src" / "db" / "migrations"
+MIGRATIONS = "src/db/migrations"
 ROLE = "seo_agent"
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
 
@@ -101,14 +103,14 @@ def required(tables: set[str]) -> dict[str, set[str]]:
 
 def migrated_tables() -> set[str]:
     names: set[str] = set()
-    for path in MIGRATIONS.glob("*.sql"):
+    for path in www(MIGRATIONS).glob("*.sql"):
         names.update(re.findall(r'CREATE TABLE (?:IF NOT EXISTS )?"?([a-z_0-9]+)"?', path.read_text(), re.IGNORECASE))
     assert len(names) > 80, "could not read the web app's migrations"
     return names
 
 
 def migration_statements() -> list[str]:
-    return [stmt for path in sorted(MIGRATIONS.glob("*.sql")) for stmt in path.read_text().split("--> statement-breakpoint") if stmt.strip()]
+    return [stmt for path in sorted(www(MIGRATIONS).glob("*.sql")) for stmt in path.read_text().split("--> statement-breakpoint") if stmt.strip()]
 
 
 def script_text() -> str:

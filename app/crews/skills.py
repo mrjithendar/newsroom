@@ -1,6 +1,6 @@
 """Agent skills (D-96, docs/seo/CREWS.md "Skills"): guidance each crew agent gets in its system prompt.
 
-Where they come from: the web app (AI room → Skills; services/www/src/lib/seo-agent/skills.ts) serves the enabled
+Where they come from: the web app (AI room → Skills; moks-cms/src/lib/seo-agent/skills.ts) serves the enabled
 skills at GET /internal/seo-agent/skills: the shipped defaults (which an admin may have edited) and the admin's own.
 `run_crew` reads them once per run (`fetch`) and `build_agents` gives each agent the ones that match it (`select`).
 

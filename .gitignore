@@ -1,6 +1,17 @@
-.venv/
+# Python
 __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-models/
+.venv/
+*.egg-info/
+
+# moks-cms checked out by CI for the contract tests (tests/moks_cms.py)
+/.moks-cms/
+
+# Embedding model downloaded for local runs (the image fetches its own)
+/models/
+
+.env
+.env.*
+.DS_Store

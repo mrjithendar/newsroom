@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,11 +22,12 @@ from app.news.crew import AGENTS as NEWS_AGENTS
 from app.news.crew import NewsDeskCrew
 from app.webapp import WebAppError
 from tests.conftest import FakeWebApp, hits, settings
+from tests.moks_cms import www
 from tests.news_fixtures import NewsWeb, good_draft
 from tests.test_crews import BRIEF, final_json, scripted
 from tests.test_news_crew import ITEM, PRIMARY, script
 
-SKILLS_TS = Path(__file__).resolve().parents[2] / "www" / "src" / "lib" / "seo-agent" / "skills.ts"
+SKILLS_TS = "src/lib/seo-agent/skills.ts"
 
 
 def row(name: str, agents: list[str], tags: list[str] | None = None, text: str | None = None, version: int = 1) -> dict[str, Any]:
@@ -159,7 +159,7 @@ def _ts_list(block: str, key: str) -> list[str]:
 
 
 def test_the_web_apps_agent_list_matches_the_crews() -> None:
-    src = SKILLS_TS.read_text()
+    src = www(SKILLS_TS).read_text()
     block = src[src.index("export const CREW_AGENTS") : src.index("];", src.index("export const CREW_AGENTS"))]
     ts_agents = set(_ts_list(block, "key"))
     crews = {"editorial": ED_AGENTS, "optimization": OPT_AGENTS, "promotion": PROMO_AGENTS, "report": REPORT_AGENTS, "news": NEWS_AGENTS}
@@ -167,7 +167,7 @@ def test_the_web_apps_agent_list_matches_the_crews() -> None:
 
 
 def test_every_default_skill_targets_real_agents_and_tags_a_run_can_have() -> None:
-    src = SKILLS_TS.read_text()
+    src = www(SKILLS_TS).read_text()
     body = src[src.index("export const DEFAULT_SKILLS") : src.index("const DEFAULT_BY_NAME")]
     names = re.findall(r'name: "([a-z0-9-]+)"', body)
     agents = {a for line in re.findall(r"agents: \[([^\]]*)\]", body) for a in re.findall(r'"([^"]+)"', line)}

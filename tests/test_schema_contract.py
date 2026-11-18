@@ -1,7 +1,7 @@
 """Contract: the web app tables that the Postgres tests declare by hand are still what the web app's migrations create.
 
 The agent reads and writes the web app's database. Its tests declare the few columns they need inline, so a migration
-in services/www that renames, drops or retypes one of those columns would leave these tests green while the agent
+in moks-cms that renames, drops or retypes one of those columns would leave these tests green while the agent
 fails in production. Here every migration is applied to a scratch database, each hand-written `create table` found in
 the test sources is created beside it, and each of its columns has to exist in the real table with the same type.
 
@@ -18,8 +18,9 @@ from typing import Any
 
 import pytest
 
+from tests.moks_cms import www
+
 TESTS = Path(__file__).resolve().parent
-MIGRATIONS = TESTS.parents[1] / "www" / "src" / "db" / "migrations"
 # Created by the agent itself (app/index.py: the vector width follows the embedding model), not by a migration.
 AGENT_OWNED = {"seo_article_chunks"}
 
@@ -42,7 +43,7 @@ def hand_written_tables() -> list[tuple[str, str, str]]:
 
 def migration_statements() -> list[str]:
     """Every statement of every migration, in the order the web app's migrator applies them (by file name)."""
-    files = sorted(MIGRATIONS.glob("*.sql"))
+    files = sorted(www("src/db/migrations").glob("*.sql"))
     assert len(files) >= 30, "could not find the web app's migrations"
     return [stmt for path in files for stmt in path.read_text().split("--> statement-breakpoint") if stmt.strip()]
 
@@ -75,7 +76,7 @@ async def test_hand_written_tables_match_the_web_app_migrations() -> None:
         await admin.execute(f"create database {database}")
         try:
             async with await psycopg.AsyncConnection.connect(make_conninfo(url, dbname=database), autocommit=True) as c:
-                # The migrator's own ledger (services/www/src/db/migrate.ts), then every migration in its order.
+                # The migrator's own ledger (moks-cms/src/db/migrate.ts), then every migration in its order.
                 await c.execute("create table schema_migrations (name text primary key, applied_at timestamptz not null default now())")
                 for stmt in migrations:
                     await c.execute(stmt)

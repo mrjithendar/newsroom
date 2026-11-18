@@ -8,7 +8,7 @@
 --
 -- How (docs/seo/SECURITY.md has the whole runbook; nothing changes until you do this):
 --   1. Run this file as a superuser in the site's database. It can be run again at any time:
---        psql "$SUPERUSER_URL" -v ON_ERROR_STOP=1 -f services/seo-agent/scripts/db-role.sql
+--        psql "$SUPERUSER_URL" -v ON_ERROR_STOP=1 -f scripts/db-role.sql
 --   2. ALTER ROLE seo_agent LOGIN PASSWORD '…';
 --   3. Create Secret jithendar/seo-agent-db-credentials with key `uri` and restart deploy/seo-agent.
 --

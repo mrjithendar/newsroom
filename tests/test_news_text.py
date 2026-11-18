@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
 from app.news import feeds, text
 from app.news.config import JobConfig, load_news_settings
 from app.news.cron import Cron, CronError
+from tests.moks_cms import www
 from tests.news_fixtures import FEEDS, K8S_TEXT
 
 
@@ -131,11 +131,11 @@ def test_cron_rejects(bad: str) -> None:
 # --- config ---------------------------------------------------------------------------------------------------------
 
 
-FIXTURE = Path(__file__).resolve().parents[2] / "www" / "docs" / "news" / "fixtures" / "job-config.json"
+FIXTURE = "docs/news/fixtures/job-config.json"
 
 
 def test_shared_job_config_fixture_parses() -> None:
-    cfg = JobConfig.model_validate(json.loads(FIXTURE.read_text()))
+    cfg = JobConfig.model_validate(json.loads(www(FIXTURE).read_text()))
     assert abs(sum(cfg.effective_weights().values()) - 1) < 1e-6
 
 

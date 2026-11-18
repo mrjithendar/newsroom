@@ -23,7 +23,7 @@ for _k, _v in {
 }.items():
     os.environ.setdefault(_k, _v)
 
-# Official documentation only (the host or a subdomain). Keep equal to services/www/src/lib/seo-agent/config.ts.
+# Official documentation only (the host or a subdomain). Keep equal to moks-cms/src/lib/seo-agent/config.ts.
 DEFAULT_DOCS_ALLOWLIST = (
     "kubernetes.io",
     "docs.aws.amazon.com",

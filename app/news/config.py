@@ -1,4 +1,4 @@
-"""News job config and global news settings. The same shapes are validated by zod in services/www/src/lib/news/schema.ts;
+"""News job config and global news settings. The same shapes are validated by zod in moks-cms/src/lib/news/schema.ts;
 tests/test_news_config.py and the web test news-desk.test.ts both parse docs/news/fixtures/job-config.json so the two
 stay in step.
 

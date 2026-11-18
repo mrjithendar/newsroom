@@ -1,0 +1,161 @@
+name: seo-agent
+
+# check   → pull requests and manual runs: ruff, mypy, pytest (with a pgvector PostgreSQL service, so the flow-run,
+#           persistence, advisory-lock and retrieval tests run), pip-audit of the locked production dependencies, and a
+#           Docker build of the image (model checksums verified inside the build) with a smoke test of both ports
+#           (internal API 8080, MCP edge 8090; scripts/smoke-image.sh). The contract tests read moks-cms (its
+#           migrations, callback routes and shared constants; tests/moks_cms.py), so moks-tech/moks-cms master is
+#           checked out next to the code with secret CROSS_REPO_READ_TOKEN. On a merged pull request `check` runs only
+#           the tests: the image is built once, by `release`.
+# release → a merged pull request: build arm64, smoke-test it, push registry.jithendar.com/jithendar/seo-agent:latest.
+#           Then, when repository variable RELEASE_NOTIFY_REPOS lists site repositories, each gets a repository_dispatch
+#           "moks-cms-released" {component: seo-agent, tag: latest} (scripts/notify-sites.sh).
+# Nothing here deploys: the manifests and the rollout live in each site's repository (jithendar.com:
+# moks-tech/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
+#
+# Secrets (repository level: private repositories on GitHub Free cannot read organization secrets):
+#   CROSS_REPO_READ_TOKEN  fine-grained token, Contents: read on moks-tech/moks-cms. Also a Dependabot secret, or
+#                          Dependabot's pull requests cannot check moks-cms out.
+#   HARBOR_USERNAME, HARBOR_PASSWORD  the Harbor robot that pushes to project jithendar.
+#   RELEASE_NOTIFY_TOKEN   fine-grained token, Contents: read and write on the site repositories (optional).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seo-agent-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && (github.event.action != 'closed' || github.event.pull_request.merged == true))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        # Same pgvector minor as the cluster's CloudNativePG image (0.8.x), PostgreSQL 18.
+        image: pgvector/pgvector:0.8.1-pg18
+        env:
+          POSTGRES_PASSWORD: ci-only-not-secret
+          POSTGRES_DB: seo_agent_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SEO_AGENT_TEST_DATABASE_URL: postgresql://postgres:ci-only-not-secret@localhost:5432/seo_agent_test
+      UV_PYTHON_DOWNLOADS: never
+      # tests/moks_cms.py: a missing checkout here is an error, never a skipped contract test.
+      MOKS_CMS_DIR: ${{ github.workspace }}/.moks-cms
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A merged pull request is built from its merge commit on the default branch.
+          ref: ${{ github.event.action == 'closed' && github.event.pull_request.merge_commit_sha || '' }}
+      - name: Secret CROSS_REPO_READ_TOKEN is set
+        env:
+          TOKEN: ${{ secrets.CROSS_REPO_READ_TOKEN }}
+        run: |
+          [[ -n "$TOKEN" ]] || { echo "::error::Secret CROSS_REPO_READ_TOKEN (Contents: read on moks-tech/moks-cms) is not set; the contract tests need moks-cms."; exit 1; }
+      - name: Check out moks-cms (for the contract tests)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: moks-tech/moks-cms
+          path: .moks-cms
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install uv (pinned)
+        run: pip install --quiet "uv==0.13.5"
+      - name: Install locked dependencies
+        run: uv sync --frozen --python python3.13
+      - name: Lint (ruff)
+        run: uv run --frozen ruff check app tests
+      - name: Types (mypy)
+        run: uv run --frozen mypy app
+      - name: Tests (pytest, incl. Postgres + pgvector and the moks-cms contract)
+        run: uv run --frozen pytest -q -rs
+      - name: RAG eval smoke (hashed embeddings; only that it runs; the real run is rag-eval.yml)
+        run: uv run --frozen python scripts/rag_eval.py --embeddings hash --configs baseline-v4,token-hybrid --dsn "$SEO_AGENT_TEST_DATABASE_URL" --out "$RUNNER_TEMP/rag-eval"
+      - name: Dependency audit (pip-audit on the locked production set)
+        # Isolated: pip-audit's own dependencies conflict with crewai's pins, so it audits an exported requirements file.
+        run: |
+          set -euo pipefail
+          uv export --frozen --no-dev --no-hashes --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
+          # chromadb 1.5.9 (pinned by crewai, no fixed release): the advisories concern a running Chroma server/client,
+          # which this service never starts or connects to (memory=False); it is only imported. Accepted, moks-cms
+          # docs/seo/DECISIONS.md D-53.
+          uvx --from "pip-audit==2.10.1" pip-audit --strict --progress-spinner off -r "$RUNNER_TEMP/requirements.txt" \
+            --ignore-vuln PYSEC-2026-311 --ignore-vuln PYSEC-2026-3813 --ignore-vuln PYSEC-2026-3814 --ignore-vuln PYSEC-2026-3815
+      # Image steps: pull requests and manual runs only. A merged pull request's image is built (once) by `release`.
+      - name: Build the image (no push)
+        if: github.event.action != 'closed'
+        run: docker build --provenance=false -t seo-agent:ci .
+      - name: Image size (summary; fails above +15 % of the stored baseline)
+        if: github.event.action != 'closed'
+        run: scripts/image-size.sh seo-agent:ci image-size-baseline.json
+      - name: Image smoke test
+        if: github.event.action != 'closed'
+        run: scripts/smoke-image.sh seo-agent:ci "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
+
+  release:
+    needs: check
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == github.event.repository.default_branch
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    concurrency:
+      group: seo-agent-release
+      cancel-in-progress: false
+    # For the smoke test: the image must start against a database without the web app's tables (as in `check`).
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg18
+        env:
+          POSTGRES_PASSWORD: ci-only-not-secret
+          POSTGRES_DB: seo_agent_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      IMAGE: registry.jithendar.com/jithendar/seo-agent:latest
+      RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A merged pull request is built from its merge commit on the default branch.
+          ref: ${{ env.RELEASE_SHA }}
+      - name: Build the image
+        # Only :latest: sites run :latest and restart the agent on each release.
+        run: docker build --platform linux/arm64 --provenance=false -t "$IMAGE" .
+      - name: Image size (summary only; the gate runs on the pull request's amd64 build)
+        run: scripts/image-size.sh "$IMAGE" /dev/null
+      # Never push an image that cannot start: this is the image that is pushed, not a rebuild of it.
+      - name: Image smoke test
+        run: scripts/smoke-image.sh "$IMAGE" "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$HARBOR_USERNAME" && -n "$HARBOR_PASSWORD" ]] || { echo "::error::Secrets HARBOR_USERNAME and HARBOR_PASSWORD must be set"; exit 1; }
+          printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
+      - name: Push
+        run: |
+          set -euo pipefail
+          docker push --quiet "$IMAGE"
+          {
+            echo "- $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+            echo "- pull request #${{ github.event.pull_request.number }}, commit $RELEASE_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Tell the site repositories
+        env:
+          REPOS: ${{ vars.RELEASE_NOTIFY_REPOS }}
+          GH_TOKEN: ${{ secrets.RELEASE_NOTIFY_TOKEN }}
+        run: scripts/notify-sites.sh seo-agent latest "$RELEASE_SHA"
