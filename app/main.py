@@ -3,7 +3,12 @@
 Internal API (port 8080, ClusterIP; NetworkPolicy admits only the web pods, the trigger CronJobs and Prometheus).
 Every endpoint except /healthz, /readyz and /metrics needs `Authorization: Bearer $SEO_AGENT_TOKEN`:
 
+    GET  /flows                         every flow: input JSON Schema, schedulable, crews (CrewAI console)
+    POST /flows/{flow_name}/validate    {inputs} → {inputs} as the flow would get them, or 422
     POST /flows/{flow_name}/kickoff     {inputs, triggered_by: cron|manual, actor?} → {run_id}
+    POST /schedules/dispatch            start every schedule that is due (one CronJob, every minute; app/schedules.py)
+    GET  /crews                         each crew's editable configuration as the code defines it (app/crews/config.py)
+    POST /crews/{crew}/validate         {config} → {config} as it would be stored (only what differs), or 422
     GET  /flows/runs                    ?flow=&status=&draft_id=&limit=
     GET  /flows/runs/{run_id}           status, current step, outputs, errors, cost
     POST /flows/runs/{run_id}/cancel
@@ -35,12 +40,14 @@ from . import metrics
 from .ask import AskService, MemoryAskLog, PgAskLog
 from .ask_runtime import PgAskRuntime, StaticAskRuntime
 from .config import Settings, load_settings
+from .crews import config as crew_config
 from .crews.editorial import EditorialCrew
 from .crews.optimization import OptimizationCrew
 from .crews.promotion import PromotionCrew
 from .crews.report import ReportCrew
 from .embeddings import HashEmbeddings
-from .flows import SPECS, check_kickoff
+from .flows import CRON_FLOWS, SPECS, check_kickoff
+from .flows import catalogue as flow_catalogue
 from .flows.base import Deps
 from .index import MemoryRetriever, PgVectorIndex
 from .lance_admin import LanceAdmin, LanceError
@@ -53,6 +60,8 @@ from .run_history import MemoryHistorySink, PgHistorySink, RecordingLlm, RunHist
 from .run_history import install as install_run_log
 from .run_history import uninstall as uninstall_run_log
 from .runs import FlowRunner, MemoryFlowPersistence, MemoryLocks, MemoryRunStore, PgAdvisoryLocks, PgFlowPersistence, PgRunStore, RunError, view
+from .schedules import MemoryScheduleStore, PgScheduleStore, SchedulesUnavailable
+from .schedules import dispatch as dispatch_schedules
 from .schemas import AskRequest
 from .seo_ml.store import MemoryMlStore, PgMlStore
 from .services import review
@@ -85,6 +94,16 @@ class Kickoff(BaseModel):
     actor: str | None = Field(default=None, max_length=200)
 
 
+class FlowInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class CrewConfigBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: Literal["approve", "reject", "regenerate"]
@@ -113,6 +132,8 @@ class Container:
     lance: LanceAdmin = field(default_factory=lambda: lance_from_env(dict(os.environ)))  # /admin/lancedb (D-92)
     mirror: ArticleMirror | None = None  # the article index copied into LanceDB (D-93; app/lance_index.py)
     history: RunHistory | None = None  # steps, log lines and model calls of every flow run (app/run_history.py)
+    schedules: Any = field(default_factory=MemoryScheduleStore)  # seo_flow_schedules (app/schedules.py)
+    clock: Callable[[], Any] | None = None  # tests: the dispatcher's "now"
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
@@ -206,7 +227,7 @@ async def build_container(settings: Settings) -> Container:
     deps.runner = runner
     # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history)
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool))
     c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
     c.mirror = ArticleMirror(c.lance, fetch_from(pool), enabled=settings.lancedb_article_index)
     deps.reindex = c.reindex
@@ -397,6 +418,48 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.get("/metrics")
     async def metrics_ep() -> PlainTextResponse:
         return PlainTextResponse(generate_latest(metrics.REGISTRY).decode(), media_type="text/plain; version=0.0.4")
+
+    # --- CrewAI console (D-98): the flow catalogue, Run with parameters, schedules, crew configuration ---
+
+    @app.get("/flows", dependencies=[Depends(auth)])
+    async def flows() -> dict[str, Any]:
+        return {"items": flow_catalogue()}
+
+    @app.post("/flows/{flow_name}/validate", dependencies=[Depends(auth)])
+    async def validate_inputs(flow_name: str, body: FlowInputs) -> Any:
+        spec = SPECS.get(flow_name)
+        if spec is None:
+            raise HTTPException(404, f"unknown flow {flow_name}")
+        try:
+            return {"inputs": spec.input_model.model_validate(body.inputs).model_dump(exclude_none=True)}
+        except ValueError as e:
+            return JSONResponse({"error": f"invalid inputs for {flow_name}: {str(e)[:500]}"}, status_code=422)
+
+    @app.post("/schedules/dispatch", dependencies=[Depends(auth)])
+    async def dispatch(request: Request) -> JSONResponse:
+        from datetime import timedelta
+
+        c = ctr(request)
+        try:
+            out = await dispatch_schedules(c.schedules, c.runner, schedulable=CRON_FLOWS, now=c.clock() if c.clock else None, catchup=timedelta(minutes=c.settings.schedule_catchup_min))
+        except SchedulesUnavailable as e:
+            return JSONResponse({"error": str(e)}, status_code=503)
+        return JSONResponse(out)
+
+    @app.get("/crews", dependencies=[Depends(auth)])
+    async def crews() -> dict[str, Any]:
+        return {"items": [crew_config.catalogue(c) for c in crew_config.registry().values()]}
+
+    @app.post("/crews/{crew}/validate", dependencies=[Depends(auth)])
+    async def validate_crew(crew: str, body: CrewConfigBody) -> JSONResponse:
+        c = crew_config.registry().get(crew)
+        if c is None:
+            raise HTTPException(404, f"unknown crew {crew}")
+        try:
+            ov = crew_config.validate(c, body.config)
+        except crew_config.OverlayError as e:
+            return JSONResponse({"error": "the crew configuration is not valid", "issues": e.issues}, status_code=422)
+        return JSONResponse({"config": crew_config.normalize(c, ov), "default_hash": crew_config.default_hash(c), "prompt_version": c.prompt_version})
 
     @app.post("/flows/{flow_name}/kickoff", dependencies=[Depends(auth)])
     async def kickoff(flow_name: str, body: Kickoff, request: Request) -> JSONResponse:

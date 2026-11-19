@@ -17,7 +17,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import Settings
+from ..crews import config as crew_config
 from ..crews.common import AgentDef, CrewRun, build_agents, make_crew, run_crew, task_raw
+from ..crews.config import CrewDef, TaskDef
 from ..crews.skills import news_tags
 from ..tools import data_block
 from .schemas import FactFlag, FactSheet, ImageBrief, NewsDraft
@@ -43,6 +45,39 @@ CREW_RULES = (
     "3. Never invent people, quotes, numbers, dates, versions or URLs. If the sources do not support a claim, leave it out.\n"
     "4. The article must add value for DevOps/cloud/AI engineers: a “Why it matters” section, impact, and what to do.\n"
     "5. Do not write a Sources section in the body: the site renders the sources list from the structured `sources` field."
+)
+
+RESEARCH_TASK = "Build the fact sheet for this story. Read the items (read_news_item) and fetch primary sources (fetch_allowlisted) where they exist. Return JSON matching FactSheet."
+ANALYSIS_TASK = "Write the analysis for engineers from the fact sheet: why it matters, who is affected, what to do, migration notes, commands (only if a source shows them, with its URL)."
+WRITE_TASK = "Write the article body in MDX (no H1, no Sources section) following the writing profile. Include a '## Why it matters' section. {digest}"
+CHECK_TASK = "Fact-check the draft against the fact sheet. Return the corrected body, then a list of removed claims and flagged claims with reasons."
+SEO_TASK = (
+    "Produce the final draft as JSON matching NewsDraft: title (≤ 60 chars), dek, meta_description (120–155), slug_suggestion, body_mdx (the fact-checked body), "
+    "key_takeaways, why_it_matters, headings, sources (only URLs from the fact sheet, with publisher), fact_check_report, categories and tags (from the suggestions), "
+    "internal_links (≤ 3, only paths from vector_search_site), schema_jsonld (@type NewsArticle, headline, description), reading_time_minutes, confidence, warnings{digest_items}."
+)
+ART_TASK = "Write the cover image brief as JSON matching ImageBrief: subject, composition, style_notes, avoid (always include people, faces, logos, trademarks, text). Use image_profile."
+DIGEST_NOTE = "Digest: one section per story with a short summary, why it matters, and its sources."
+_RULES = "Starts with the crew's rules (CREW_RULES: sources only, no copying, no invented facts, a Why it matters section, no Sources section)."
+# The crew's editable configuration (crews/config.py, CrewAI console → Crews). The crew rules, the story, sources and
+# writing-profile blocks, the output schemas and the quality gates after the crew stay in code. The writing and image
+# profiles (Admin → News) are edited where they are, not here.
+CREW = CrewDef(
+    crew="news",
+    label="News desk crew",
+    description="Writes one news story or digest from the news desk's clustered items: fact sheet, analysis, draft, fact check, SEO metadata and a cover brief.",
+    prompt_version=PROMPT_VERSION,
+    agents=tuple(AGENTS),
+    tasks=(
+        TaskDef("research", "researcher", "Fact sheet", RESEARCH_TASK, "One JSON object: {claims: [{id, claim, source_url, snippet, kind}], primary_sources: [url], open_questions: []}.", contract=f"{_RULES} Then the story and sources blocks; the answer is parsed as FactSheet.", output_editable=False),
+        TaskDef("analysis", "analyst", "Analysis", ANALYSIS_TASK, "Analysis notes: why it matters, who is affected, what to do, migration, commands with source URLs.", contract=f"{_RULES} Then the story block."),
+        TaskDef("write", "writer", "Draft", WRITE_TASK, "Title, dek, key takeaways and the MDX body.", variables=("digest",), contract=f"{_RULES} Then the story block, the writing profile and any feedback. {{digest}} is the digest instruction in a digest, else empty."),
+        TaskDef("check", "fact_checker", "Fact check", CHECK_TASK, "Corrected MDX body, removed claims, flagged claims.", contract=_RULES),
+        TaskDef("seo", "seo_editor", "Final draft (JSON)", SEO_TASK, "One JSON object matching NewsDraft.", variables=("digest_items",), contract=f"{_RULES} Then the story block and any feedback; the answer is parsed as NewsDraft. {{digest_items}} is ', digest_items' in a digest, else empty.", output_editable=False),
+        TaskDef("art", "art_director", "Cover brief", ART_TASK, "One JSON object matching ImageBrief.", contract="Then the story block; the answer is parsed as ImageBrief.", output_editable=False),
+    ),
+    replay=("news_draft_flow", "news_playground_flow"),
+    default_models="profile",
 )
 
 
@@ -81,9 +116,10 @@ class NewsDeskCrew:
         ctx = NewsToolContext(self.web, self.retriever, items=items, allow_hosts=allow_hosts, writing_profile=writing_profile, image_profile=image_profile)
         settings = replace(self.settings, crew_max_tokens_per_run=max_tokens)
         default_model = writing_profile.get("model") or None
+        cfg = await crew_config.load("news", self.web)
 
         def build(loop: asyncio.AbstractEventLoop, run: CrewRun) -> tuple[Any, list[Any]]:
-            agents = build_agents(AGENTS, settings, self.llm, loop, run, ctx, draft_id=None, purpose="news.crew", prompt_version=PROMPT_VERSION, crew="news", models=models or {}, default_model=default_model)
+            agents = build_agents(cfg.agents(), settings, self.llm, loop, run, ctx, draft_id=None, purpose="news.crew", prompt_version=cfg.prompt_version, crew="news", models=models or {}, default_model=default_model)
             story = data_block("story", {k: brief.get(k) for k in ("mode", "title", "cluster_id", "topics", "suggested_categories", "suggested_tags", "length_words", "today", "digest_stories")})
             sources = data_block("sources", [{"id": str(i["id"]), "url": i["url"], "title": i["title"], "publisher": i.get("source_name"), "published_at": str(i.get("published_at") or ""), "excerpt": str(i.get("clean_text") or i.get("excerpt") or "")[:3000]} for i in items[:12]])
             profile = data_block("writing_profile", {k: writing_profile.get(k) for k in ("system_style", "structure_template", "tone", "audience", "banned_phrases", "required_sections")})
@@ -94,18 +130,19 @@ class NewsDeskCrew:
                 if isinstance(fs, FactSheet):
                     ctx.facts = fs.model_dump()
 
-            research = Task(description=f"{CREW_RULES}\n\nBuild the fact sheet for this story. Read the items (read_news_item) and fetch primary sources (fetch_allowlisted) where they exist. Return JSON matching FactSheet.\n\n{story}\n\n{sources}", expected_output="One JSON object: {claims: [{id, claim, source_url, snippet, kind}], primary_sources: [url], open_questions: []}.", agent=agents["researcher"], output_pydantic=FactSheet, callback=keep_facts)
-            analysis = Task(description=f"{CREW_RULES}\n\nWrite the analysis for engineers from the fact sheet: why it matters, who is affected, what to do, migration notes, commands (only if a source shows them, with its URL).\n\n{story}", expected_output="Analysis notes: why it matters, who is affected, what to do, migration, commands with source URLs.", agent=agents["analyst"], context=[research])
-            write = Task(description=f"{CREW_RULES}\n\nWrite the article body in MDX (no H1, no Sources section) following the writing profile. Include a '## Why it matters' section. {'Digest: one section per story with a short summary, why it matters, and its sources.' if brief.get('mode') == 'digest' else ''}\n\n{story}\n\n{profile}{fb}", expected_output="Title, dek, key takeaways and the MDX body.", agent=agents["writer"], context=[research, analysis])
-            check = Task(description=f"{CREW_RULES}\n\nFact-check the draft against the fact sheet. Return the corrected body, then a list of removed claims and flagged claims with reasons.", expected_output="Corrected MDX body, removed claims, flagged claims.", agent=agents["fact_checker"], context=[research, write])
+            digest = brief.get("mode") == "digest"
+            research = Task(description=f"{CREW_RULES}\n\n{cfg.instructions('research')}\n\n{story}\n\n{sources}", expected_output=cfg.expected_output("research"), agent=agents["researcher"], output_pydantic=FactSheet, callback=keep_facts)
+            analysis = Task(description=f"{CREW_RULES}\n\n{cfg.instructions('analysis')}\n\n{story}", expected_output=cfg.expected_output("analysis"), agent=agents["analyst"], context=[research])
+            write = Task(description=f"{CREW_RULES}\n\n{cfg.instructions('write', digest=DIGEST_NOTE if digest else '')}\n\n{story}\n\n{profile}{fb}", expected_output=cfg.expected_output("write"), agent=agents["writer"], context=[research, analysis])
+            check = Task(description=f"{CREW_RULES}\n\n{cfg.instructions('check')}", expected_output=cfg.expected_output("check"), agent=agents["fact_checker"], context=[research, write])
             seo = Task(
-                description=f"{CREW_RULES}\n\nProduce the final draft as JSON matching NewsDraft: title (≤ 60 chars), dek, meta_description (120–155), slug_suggestion, body_mdx (the fact-checked body), key_takeaways, why_it_matters, headings, sources (only URLs from the fact sheet, with publisher), fact_check_report, categories and tags (from the suggestions), internal_links (≤ 3, only paths from vector_search_site), schema_jsonld (@type NewsArticle, headline, description), reading_time_minutes, confidence, warnings{', digest_items' if brief.get('mode') == 'digest' else ''}.\n\n{story}{fb}",
-                expected_output="One JSON object matching NewsDraft.",
+                description=f"{CREW_RULES}\n\n{cfg.instructions('seo', digest_items=', digest_items' if digest else '')}\n\n{story}{fb}",
+                expected_output=cfg.expected_output("seo"),
                 agent=agents["seo_editor"],
                 context=[research, check],
                 output_pydantic=NewsDraft,
             )
-            art = Task(description="Write the cover image brief as JSON matching ImageBrief: subject, composition, style_notes, avoid (always include people, faces, logos, trademarks, text). Use image_profile.\n\n" + story, expected_output="One JSON object matching ImageBrief.", agent=agents["art_director"], context=[seo], output_pydantic=ImageBrief)
+            art = Task(description=f"{cfg.instructions('art')}\n\n" + story, expected_output=cfg.expected_output("art"), agent=agents["art_director"], context=[seo], output_pydantic=ImageBrief)
             tasks = [research, analysis, write, check, seo, art]
             return make_crew(agents, tasks, settings), tasks
 

@@ -157,6 +157,8 @@ class Settings:
     admin_mcp_rpm_per_token: int = 120
     admin_kickoffs_per_hour: int = 10
     flow_timeout_s: int = 1800  # wall clock per flow run (crews have their own, shorter limit)
+    # Schedules (app/schedules.py): how late a missed fire time still runs, e.g. after the agent was down.
+    schedule_catchup_min: int = 60
 
     @property
     def admin_mcp_resource(self) -> str:
@@ -258,4 +260,5 @@ def load_settings() -> Settings:
         admin_mcp_rpm_per_token=max(1, _int("ADMIN_MCP_RPM_PER_TOKEN", Settings.admin_mcp_rpm_per_token)),
         admin_kickoffs_per_hour=max(1, _int("ADMIN_MCP_KICKOFFS_PER_HOUR", Settings.admin_kickoffs_per_hour)),
         flow_timeout_s=max(60, _int("SEO_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s)),
+        schedule_catchup_min=max(2, min(1440, _int("SCHEDULE_CATCHUP_MINUTES", Settings.schedule_catchup_min))),
     )

@@ -48,6 +48,7 @@ NOT_A_TABLE = {"api_key"}
 BY_COLUMN: dict[str, dict[str, set[str]]] = {
     "user": {"SELECT": {"id", "role", "banned"}},
     "seo_mcp_grants": {"UPDATE": {"last_used_at"}},
+    "seo_flow_schedules": {"UPDATE": {"last_slot", "last_fired_at", "last_status", "last_run_id", "last_error"}},
 }
 # Created by the agent itself (app/index.py) and owned by its role.
 OWNED = ("seo_article_chunks", "seo_article_chunks_next")
