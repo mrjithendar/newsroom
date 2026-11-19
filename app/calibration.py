@@ -32,8 +32,20 @@ class Calibration:
 
 BGE_SMALL = Calibration(ask_min_score=0.66, cluster_join_cosine=0.80, cluster_entity_cosine=0.66, dedupe_semantic_cosine=0.95, paragraph_cosine=0.93)
 
+# bge-m3:567m on mk4's Ollama, measured 2026-11-19 with scripts/calibrate_embeddings.py: 189 items from the desk's seven
+# default feeds, 17,766 item pairs + 189 item/reworded-copy pairs, Spearman 0.770 between the two models' cosines.
+# Each bge-small cutoff keeps its share of pairs (agreement F1 with bge-small's decision in brackets):
+#   cluster_entity 0.66 → 0.523 (0.68) · cluster_join 0.80 → 0.699 (0.87) · paragraph 0.93 → 0.916 (0.98) ·
+#   dedupe_semantic 0.95 → 0.933 (0.96). bge-m3 spreads unrelated items lower (pair median 0.47 vs 0.61) and keeps
+#   reworded copies as close (copy median 0.97 vs 0.98), so the low cutoffs move most.
+# ask_min_score is INTERIM: bge-small's 0.66 mapped the same way (0.523), not yet rag_eval.py's calibrated floor on the
+# evaluation set, which is how the bge-small value was set. Replace it with that measurement before jithendar.com
+# switches EMBEDDINGS_PROVIDER to ollama (or set ASK_BLOG_MIN_SCORE there).
+BGE_M3 = Calibration(ask_min_score=0.52, cluster_join_cosine=0.70, cluster_entity_cosine=0.52, dedupe_semantic_cosine=0.93, paragraph_cosine=0.92)
+
 CALIBRATIONS: dict[str, Calibration] = {
     "bge-small-en-v1.5": BGE_SMALL,
+    "bge-m3": BGE_M3,
 }
 
 
