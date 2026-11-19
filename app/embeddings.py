@@ -3,7 +3,8 @@
 EMBEDDINGS_PROVIDER:
 - onnx (default): BAAI/bge-small-en-v1.5 exported to ONNX (384 dimensions), run with ONNX Runtime on CPU. No torch.
   The model files are baked into the image at build time (Dockerfile, pinned revision + checksums).
-- ollama: an Ollama already running in the cluster (OLLAMA_URL, model OLLAMA_EMBED_MODEL, e.g. nomic-embed-text).
+- ollama: an Ollama already running in the cluster (OLLAMA_URL, model OLLAMA_EMBED_MODEL): on mk4, bge-m3:567m at
+  http://bge-m3.embeddings:11434 (1024 dimensions, no prefixes). Similarity cutoffs follow the model (app/calibration.py).
 - api: a third-party OpenAI-compatible /embeddings endpoint (EMBEDDINGS_API_URL + EMBEDDINGS_API_KEY). Off by default.
 - hash: deterministic bag-of-words hashing, for tests and local development only.
 
@@ -146,17 +147,65 @@ class OnnxEmbeddings:
         return [v for v in out if v is not None]
 
 
+# Per Ollama model (the name before ":tag"): the prefix it was trained to expect on a query and on a passage, and its
+# vector size. A model not listed here embeds without a prefix and needs OLLAMA_EMBED_DIM.
+OLLAMA_MODELS: dict[str, tuple[str, str, int]] = {
+    "nomic-embed-text": ("search_query: ", "search_document: ", 768),
+    "bge-m3": ("", "", 1024),  # no instruction: the model card embeds queries and passages alike
+}
+
+
 class OllamaEmbeddings:
-    def __init__(self, url: str, model: str, dim: int = 768):
-        self.url, self.model, self.dim = url, model, dim
+    """An Ollama in the cluster (POST /api/embed), e.g. mk4's bge-m3 service at http://bge-m3.embeddings:11434
+    (kubernetes repository, deploy/minikube/embeddings/bge-m3).
+
+    Requests carry BATCH texts: on mk4's CPU service bge-m3 embeds about 0.7 chunks a second, so one article's 40 new
+    chunks in a single request would outlast any sensible timeout. Every answer is checked for the expected number and
+    size of vectors, because the pgvector column type and the news desk's stored vectors depend on the size."""
+
+    BATCH = 8
+    # A dropped connection or a 5xx (the pod restarting, the mesh reconnecting) is retried after 2 s, then 8 s. A timeout
+    # is not: the batch already had timeout_s, and three of them would hold a reindex for 15 minutes.
+    RETRIES = 2
+
+    def __init__(self, url: str, model: str, dim: int = 0, timeout_s: float = 300.0, transport: httpx.AsyncBaseTransport | None = None):
+        self.transport = transport  # tests: httpx.MockTransport
+        if not url:
+            raise ValueError("EMBEDDINGS_PROVIDER=ollama needs OLLAMA_URL")
+        query_prefix, passage_prefix, known = OLLAMA_MODELS.get(model.split(":", 1)[0], ("", "", 0))
+        self.url, self.model, self.timeout_s = url.rstrip("/"), model, timeout_s
+        self.query_prefix, self.passage_prefix = query_prefix, passage_prefix
+        self.dim = dim or known
+        if not self.dim:
+            raise ValueError(f"OLLAMA_EMBED_DIM is required for {model!r} (known models: {', '.join(sorted(OLLAMA_MODELS))})")
         self.name = f"ollama:{model}"
 
     async def embed(self, texts: list[str], *, query: bool = False) -> list[list[float]]:
-        prefix = "search_query: " if query else "search_document: "
-        async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(f"{self.url}/api/embed", json={"model": self.model, "input": [prefix + t for t in texts]})
-            r.raise_for_status()
-            return _normalize(np.array(r.json()["embeddings"], dtype=np.float32)).tolist()
+        prefix = self.query_prefix if query else self.passage_prefix
+        out: list[list[float]] = []
+        async with httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport) as c:
+            for b in range(0, len(texts), self.BATCH):
+                batch = [prefix + t for t in texts[b : b + self.BATCH]]
+                vecs = await self._post(c, batch)
+                if len(vecs) != len(batch) or any(len(v) != self.dim for v in vecs):
+                    raise ValueError(f"{self.name} returned {[len(v) for v in vecs]} for {len(batch)} inputs; expected {self.dim} dimensions each")
+                out.extend(_normalize(np.array(vecs, dtype=np.float32)).tolist())
+        return out
+
+    async def _post(self, c: httpx.AsyncClient, batch: list[str]) -> list[list[float]]:
+        import asyncio
+
+        for attempt in range(self.RETRIES + 1):
+            try:
+                r = await c.post(f"{self.url}/api/embed", json={"model": self.model, "input": batch})
+                r.raise_for_status()
+                return list(r.json().get("embeddings") or [])
+            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+                transient = e.response.status_code >= 500 if isinstance(e, httpx.HTTPStatusError) else not isinstance(e, httpx.TimeoutException)
+                if not transient or attempt == self.RETRIES:
+                    raise
+                await asyncio.sleep(2 * 4**attempt)
+        raise AssertionError("unreachable")
 
 
 class ApiEmbeddings:
@@ -197,7 +246,7 @@ def make_embeddings(settings: Any) -> Embeddings:
     if p == "onnx":
         return OnnxEmbeddings(settings.embeddings_model_dir)
     if p == "ollama":
-        return OllamaEmbeddings(settings.ollama_url, settings.ollama_model)
+        return OllamaEmbeddings(settings.ollama_url, settings.ollama_model, getattr(settings, "ollama_embed_dim", 0), getattr(settings, "embeddings_timeout_s", 300.0))
     if p == "api":
         return ApiEmbeddings(settings.embeddings_api_url, settings.embeddings_api_key)
     if p == "hash":

@@ -166,6 +166,11 @@ def _news(deps: Deps, store: Any, embeddings: Any) -> None:
     async def embed(texts: list[str]) -> list[list[float]]:
         return await embeddings.embed(texts)
 
+    # Which model makes these vectors, and their size, travel with the function: stale stored vectors are re-embedded
+    # and the cosine cutoffs follow the model (app/news/desk.py "The embeddings model", app/calibration.py). An embed
+    # function put in its place without them (tests) keeps the behaviour from before.
+    embed.model = embeddings.name  # type: ignore[attr-defined]
+    embed.dim = embeddings.dim  # type: ignore[attr-defined]
     deps.extra.setdefault("news_store", store)
     deps.extra.setdefault("news_embed", embed)
 

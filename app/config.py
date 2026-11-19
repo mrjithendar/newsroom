@@ -131,13 +131,16 @@ class Settings:
     embeddings_model_dir: str = "/models/bge-small-en-v1.5"
     ollama_url: str = ""
     ollama_model: str = "nomic-embed-text"
+    ollama_embed_dim: int = 0  # 0 = the model's known size (embeddings.OLLAMA_MODELS)
+    embeddings_timeout_s: float = 300.0  # per request to Ollama; mk4's CPU bge-m3 takes ~12 s for a batch of 8
     embeddings_api_url: str = ""
     embeddings_api_key: str = ""
     docs_allowlist: tuple[str, ...] = field(default=DEFAULT_DOCS_ALLOWLIST)
     ask_cache_ttl_s: int = 900
     ask_top_k: int = 6
-    # Cosine pre-filter for retrieved chunks (bge-small). v5: calibrated on the eval set = the highest floor that loses
-    # no expected answer (RAG.md "Score calibration"); was 0.15. Other embedding providers need their own value.
+    # Cosine pre-filter for retrieved chunks, calibrated per embeddings model on the eval set = the highest floor that
+    # loses no expected answer (RAG.md "Score calibration"). load_settings takes the model's value from
+    # app/calibration.py unless ASK_BLOG_MIN_SCORE is set; 0.66 is bge-small's.
     ask_min_score: float = 0.66
     ask_retention_days: int = 30
     production: bool = False
@@ -189,9 +192,24 @@ def _max_iters(raw: str) -> dict[str, int]:
     return {k: n for k, n in v.items() if isinstance(k, str) and re.fullmatch(r"[a-z_]+\.[a-z_]+", k) and isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 20}
 
 
+def embeddings_model_name(provider: str, model_dir: str, ollama_model: str) -> str:
+    """What make_embeddings(...).name will be, without loading the model (app/calibration.py keys on it)."""
+    if provider == "onnx":
+        return f"onnx:{os.path.basename(model_dir.rstrip('/'))}"
+    if provider == "ollama":
+        return f"ollama:{ollama_model}"
+    return provider
+
+
 def load_settings() -> Settings:
+    from .calibration import calibration_for
+
     env = os.environ
     docs = tuple(h.strip().lower() for h in env.get("SEO_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
+    provider = env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx"
+    model_dir = env.get("EMBEDDINGS_MODEL_DIR", Settings.embeddings_model_dir)
+    ollama_model = env.get("OLLAMA_EMBED_MODEL", Settings.ollama_model)
+    floor = calibration_for(embeddings_model_name(provider, model_dir, ollama_model)).ask_min_score
     return Settings(
         # Its own, narrower database role when one is configured (scripts/db-role.sql); otherwise the web app's.
         database_url=env.get("SEO_AGENT_DATABASE_URL", "").strip() or env.get("DATABASE_URL", ""),
@@ -214,16 +232,18 @@ def load_settings() -> Settings:
         llm_timeout_s=max(30.0, min(900.0, _float("SEO_LLM_TIMEOUT_SECONDS", Settings.llm_timeout_s))),
         fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency)),
         weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles),
-        embeddings_provider=env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx",
-        embeddings_model_dir=env.get("EMBEDDINGS_MODEL_DIR", Settings.embeddings_model_dir),
+        embeddings_provider=provider,
+        embeddings_model_dir=model_dir,
         ollama_url=env.get("OLLAMA_URL", "").rstrip("/"),
-        ollama_model=env.get("OLLAMA_EMBED_MODEL", Settings.ollama_model),
+        ollama_model=ollama_model,
+        ollama_embed_dim=max(0, _int("OLLAMA_EMBED_DIM", 0)),
+        embeddings_timeout_s=max(10.0, min(1800.0, _float("EMBEDDINGS_TIMEOUT_SECONDS", Settings.embeddings_timeout_s))),
         embeddings_api_url=env.get("EMBEDDINGS_API_URL", ""),
         embeddings_api_key=env.get("EMBEDDINGS_API_KEY", ""),
         docs_allowlist=docs or DEFAULT_DOCS_ALLOWLIST,
         ask_cache_ttl_s=_int("ASK_BLOG_CACHE_TTL_SECONDS", Settings.ask_cache_ttl_s),
         ask_top_k=max(1, min(12, _int("ASK_BLOG_TOP_K", Settings.ask_top_k))),
-        ask_min_score=max(0.0, min(0.95, _float("ASK_BLOG_MIN_SCORE", Settings.ask_min_score))),
+        ask_min_score=max(0.0, min(0.95, _float("ASK_BLOG_MIN_SCORE", floor))),
         ask_retention_days=_int("ASK_BLOG_RETENTION_DAYS", Settings.ask_retention_days),
         production=env.get("APP_ENV", "") == "production",
         otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
