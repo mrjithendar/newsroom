@@ -156,6 +156,10 @@ class Prediction:
 
 def predict(model: TopicModel | None, topics: list[Topic], *, embedding: list[float] | None, entities: set[str], text: str, threshold: float) -> Prediction:
     allowed = [t for t in topics]
+    # A vector of another size came from another embeddings model than the one this classifier was trained on:
+    # featurize would cut or pad it into nonsense, so the rules answer until a model trained on these vectors serves.
+    if model is not None and embedding and len(embedding) != model.dim:
+        model = None
     if model is None or not allowed:
         r = rule_topics(text, allowed)
         return Prediction(r, r[0][1] if r else 0.0, "rules")

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import difflib
+import logging
 import uuid
 from collections import Counter
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from .. import metrics
+from ..calibration import calibration_for, effective_paragraph_cosine
 from ..llm import BudgetExceeded, CallSpec, InvalidOutput, Llm
 from . import classifier as clf
 from .budget import NewsBudget, NewsLlm, period_starts
@@ -39,6 +41,8 @@ from .scoring import V1, Features, RankerModel, TrainRow, recency_value, score_v
 from .select import Candidate, select
 from .store import DuplicateArticle, NewsStore
 from .text import clean_text, content_hash, detect_language, entity_set, extract_entities, host_of, normalize_url, simhash, top_terms, url_hash, words
+
+log = logging.getLogger("seo_agent.news.desk")
 
 DEFAULT_PRIMARY_HOSTS = ("github.com", "kubernetes.io", "cncf.io", "aws.amazon.com", "docs.aws.amazon.com", "learn.microsoft.com", "azure.microsoft.com", "cloud.google.com", "developer.hashicorp.com", "hashicorp.com", "nvd.nist.gov", "cisa.gov", "www.cisa.gov", "istio.io", "prometheus.io", "grafana.com", "argo-cd.readthedocs.io", "docs.crewai.com", "modelcontextprotocol.io", "anthropic.com", "docs.anthropic.com", "openai.com")
 
@@ -154,6 +158,69 @@ def _item_text(i: dict[str, Any]) -> str:
     return f"{i['title']}. {str(i.get('excerpt') or '')[:1200]}"
 
 
+# --- The embeddings model -------------------------------------------------------------------------------------------
+# news_items.embedding and news_clusters.centroid are real[] of whatever model made them. After a model change
+# (EMBEDDINGS_PROVIDER / OLLAMA_EMBED_MODEL) the stored vectors are another size: they are re-embedded before anything
+# compares them, and every cosine cutoff comes from the model's row in app/calibration.py. Both values travel on the
+# embed function (main._news); deps.extra may override them. Unknown (0 / ""): nothing is re-embedded, bge-small cutoffs.
+
+
+def _embedding_model(d: DeskDeps) -> str:
+    return str(d.extra.get("news_embedding_model") or getattr(d.embed, "model", "") or "")
+
+
+def _embedding_dim(d: DeskDeps) -> int:
+    return int(d.extra.get("news_embedding_dim") or getattr(d.embed, "dim", 0) or 0)
+
+
+def _stale(v: Any, dim: int) -> bool:
+    """A stored vector of another size than the current model's: another model made it."""
+    return bool(dim) and bool(v) and len(v) != dim
+
+
+# Stale vectors re-embedded per call, newest rows first: mk4's CPU bge-m3 does about one item a second, and a 14-day
+# window can hold thousands, which must not stretch one run past its timeout. The rest follow on the next runs.
+REEMBED_PER_RUN = 200
+
+
+async def _reembed(d: DeskDeps, rows: list[dict[str, Any]], key: str = "id", limit: int | None = None) -> int:
+    """Re-embeds up to `limit` (default REEMBED_PER_RUN) rows whose vector is stale, the last rows first (callers pass
+    them oldest first), in place and in news_items, from the same text as at ingest. Returns how many."""
+    dim = _embedding_dim(d)
+    cap = REEMBED_PER_RUN if limit is None else limit
+    stale = [r for r in rows if r.get(key) and r.get("title") and _stale(r.get("embedding"), dim)][::-1][:cap]
+    for k in range(0, len(stale), 32):
+        part = stale[k : k + 32]
+        for r, v in zip(part, await d.embed([_item_text(r) for r in part]), strict=True):
+            r["embedding"] = [float(x) for x in v]
+            await d.store.update_item(str(r[key]), embedding=r["embedding"])
+    if stale:
+        log.info("news: re-embedded %d items for %s", len(stale), _embedding_model(d) or "the current model", extra={"event": "news_reembedded", "count": len(stale)})
+    return len(stale)
+
+
+def _centroid(c: dict[str, Any], members: list[dict[str, Any]], by_id: dict[str, dict[str, Any]], dim: int) -> np.ndarray | None:
+    """The stored centroid, or, when another model made it, the normalised mean of its members' current vectors."""
+    v = c.get("centroid")
+    if not v:
+        return None
+    if not _stale(v, dim):
+        return np.asarray(v, dtype=np.float32)
+    vecs = [np.asarray(e, dtype=np.float32) for m in members if (e := by_id.get(str(m["id"]), m).get("embedding")) and not _stale(e, dim)]
+    if not vecs:
+        return None
+    mean = np.mean(vecs, axis=0)
+    n = float(np.linalg.norm(mean))
+    return mean / n if n > 0 else None
+
+
+def _quality(d: DeskDeps) -> Any:
+    """The quality-gate settings with the paraphrase cutoff of the current embeddings model (calibration.py)."""
+    q = d.news.quality
+    cut = effective_paragraph_cosine(q.max_paragraph_cosine, _embedding_model(d))
+    return q if cut == q.max_paragraph_cosine else q.model_copy(update={"max_paragraph_cosine": cut})
+
+
 async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], *, window_days: int) -> list[str]:
     """Embeds new items, dedupes them against the window and clusters the rest. Returns the touched cluster ids."""
     now = d.clock()
@@ -168,8 +235,16 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
             i["embedding"] = [float(x) for x in v]
             await d.store.update_item(str(i["id"]), embedding=i["embedding"])
     old = [i for i in recent if str(i["id"]) not in set(new_ids)]
-    dd = Deduper.from_existing([_sig(i, i.get("cluster_id")) for i in old], min_tokens=d.news.near_dup_min_tokens)
-    cl = Clusterer(window_hours=96, max_cves=d.news.cve_roundup_max)
+    # After a model change the window's vectors must become comparable with the fresh ones (REEMBED_PER_RUN per run).
+    # Those still waiting are compared by text only in this run: their old vectors are dropped here, not in the table.
+    await _reembed(d, old)
+    dim = _embedding_dim(d)
+    for i in old:
+        if _stale(i.get("embedding"), dim):
+            i["embedding"] = None
+    cal = calibration_for(_embedding_model(d))
+    dd = Deduper.from_existing([_sig(i, i.get("cluster_id")) for i in old], semantic_threshold=cal.dedupe_semantic_cosine, min_tokens=d.news.near_dup_min_tokens)
+    cl = Clusterer(join_cosine=cal.cluster_join_cosine, entity_cosine=cal.cluster_entity_cosine, window_hours=96, max_cves=d.news.cve_roundup_max)
     clusters = await d.store.recent_clusters(now - timedelta(hours=cl.window_hours + 24))
     members = await d.store.items_by_cluster([str(c["id"]) for c in clusters])
     for c in clusters:
@@ -178,7 +253,7 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
         cl.clusters[cid] = ClusterState(
             id=cid,
             title=c["title"],
-            centroid=np.asarray(c["centroid"], dtype=np.float32) if c.get("centroid") else None,
+            centroid=_centroid(c, members.get(cid, []), by_id, dim),
             entities=set((c.get("entities") or {}).get("set", [])) if isinstance(c.get("entities"), dict) else set(),
             cve_ids=set(c.get("cve_ids") or []),
             first_seen=c["first_seen"],
@@ -581,7 +656,7 @@ async def _draft_body(d: DeskDeps, rec: RunRecorder, job: Job, cluster_ids: list
     report_dict: dict[str, Any] = {}
     if not draft.incomplete:
         async with rec.step("quality") as o:
-            rep = await run_gates(draft, sources=sources, facts=r.facts, cfg=job.config, q=d.news.quality, banned=list(wp.get("banned_phrases") or []), required=list(wp.get("required_sections") or ["Why it matters"]), allowed_hosts=set(_allowed_hosts(items, d)), embed=d.embed, duplicate_reason=None)
+            rep = await run_gates(draft, sources=sources, facts=r.facts, cfg=job.config, q=_quality(d), banned=list(wp.get("banned_phrases") or []), required=list(wp.get("required_sections") or ["Why it matters"]), allowed_hosts=set(_allowed_hosts(items, d)), embed=d.embed, duplicate_reason=None)
             report_dict = rep.as_dict()
             for g in rep.failed_gates:
                 metrics.NEWS_QUALITY_FAILURES.labels(gate=g).inc()
@@ -772,7 +847,13 @@ async def train_models(d: DeskDeps, rec: RunRecorder, *, bootstrap: bool = False
         topics = await load_topics(d)
         rows = await d.store.label_rows()
         order = [t.slug for t in topics]
-        dim = len(next((r["embedding"] for r in rows if r.get("embedding")), []) or [0] * 384)
+        dim = _embedding_dim(d)
+        if dim:
+            # Labels outlive the window: after a model change their items still hold the old vectors.
+            # ~7 minutes on mk4's bge-m3; rows still stale are left out of this training and re-embedded next time.
+            await _reembed(d, rows, key="item_id", limit=2 * REEMBED_PER_RUN)
+            rows = [r for r in rows if not _stale(r.get("embedding"), dim)]
+        dim = dim or len(next((r["embedding"] for r in rows if r.get("embedding")), []) or [0] * 384)
         inputs = [clf.item_inputs(r) for r in rows]  # the same inputs classify_cluster builds at serving time
         labels = [set(r["topics"]) for r in rows]
         samples = [(clf.featurize(e, ents, text, topics, dim), ls) for (e, ents, text), ls in zip(inputs, labels, strict=True)]
@@ -784,6 +865,9 @@ async def train_models(d: DeskDeps, rec: RunRecorder, *, bootstrap: bool = False
             current = await active_classifier(d)
             if current is None:
                 promote, note = True, "promoted (no serving model)"
+            elif current.dim != dim:
+                # The serving model reads another embeddings model's vectors: it cannot be scored, and serves rules only.
+                promote, note = True, f"promoted: the serving {current.version} was trained on {current.dim}-dimension embeddings, these are {dim}"
             else:
                 # Both models on the same hold-out rows and topics; the serving one may have trained on some of them,
                 # which favours it, so promotion is conservative. Strict improvement by CLASSIFIER_MIN_GAIN.
