@@ -5,6 +5,8 @@
   endpoint). The runner refuses it for every other trigger: the generic kickoff API, CronJobs, child runs of other
   flows and MCP (`check_kickoff`).
 - `MCP_KICKOFF_ALLOWLIST`: what the admin MCP `kickoff_flow` tool may start. Never publish_flow.
+- `CRON_FLOWS`: what a schedule may start (app/schedules.py, the CrewAI console's Schedules).
+- `crew_test_flow`: the console's Test run of a crew configuration (app/flows/crew_test.py); started by an admin only.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from ..state import (
     ReportInput,
     WeeklyInput,
 )
+from .crew_test import CrewTestFlow, CrewTestInput
 from .jobs import Ga4SyncFlow, GscSyncFlow, TechAuditFlow
 from .maintenance import AskGapsFlow, InternalLinkingFlow, ReindexFlow
 from .ml import SeoMlFlow
@@ -85,6 +88,8 @@ SPECS: dict[str, FlowSpec] = {
     "news_train_flow": FlowSpec("news_train_flow", NewsTrainFlow.create, NEWS_INPUTS["news_train_flow"], _site),
     "news_style_review_flow": FlowSpec("news_style_review_flow", NewsStyleReviewFlow.create, NEWS_INPUTS["news_style_review_flow"], _site),
     "news_playground_flow": FlowSpec("news_playground_flow", NewsPlaygroundFlow.create, NEWS_INPUTS["news_playground_flow"], lambda i: f"{i['job_id']}:{i['cluster_id']}"),
+    # CrewAI console (D-98): a crew configuration's test run on an earlier run's inputs. One at a time per crew.
+    "crew_test_flow": FlowSpec("crew_test_flow", CrewTestFlow.create, CrewTestInput, lambda i: f"crew:{i['crew']}"),
 }
 NEWS_FLOWS = frozenset(n for n in SPECS if n.startswith("news_"))
 
@@ -92,6 +97,9 @@ APPROVAL_ONLY = frozenset({"publish_flow"})
 DRAFTING_FLOWS = ("optimize_article_flow", "new_article_flow")
 MCP_KICKOFF_ALLOWLIST = frozenset({"news_job_flow", "optimize_article_flow", "new_article_flow", "internal_linking_flow", "tech_audit_flow", "report_flow", "gsc_sync_flow", "ga4_sync_flow"})
 CRON_FLOWS = frozenset({"news_dispatch_flow", "news_train_flow", "news_style_review_flow", "gsc_sync_flow", "ga4_sync_flow", "tech_audit_flow", "weekly_recommendations_flow", "internal_linking_flow", "reindex_flow", "ask_gaps_flow", "report_flow", "seo_ml_flow", "promotion_flow", "content_ideas_flow"})
+
+
+MANUAL_ONLY = frozenset({"crew_test_flow"})  # started by a person in the console: never by a schedule, a flow or MCP
 
 
 def check_kickoff(name: str, triggered_by: str) -> None:
@@ -103,3 +111,29 @@ def check_kickoff(name: str, triggered_by: str) -> None:
         raise RunError(400, "only publish_flow is started by an approval")
     if triggered_by == "mcp" and name not in MCP_KICKOFF_ALLOWLIST:
         raise RunError(403, f"{name} cannot be started from MCP")
+    if name in MANUAL_ONLY and triggered_by != "manual":
+        raise RunError(403, f"{name} starts only from the CrewAI console")
+    if triggered_by == "cron" and name not in CRON_FLOWS:
+        raise RunError(403, f"{name} cannot be scheduled")
+
+
+def catalogue() -> list[dict[str, Any]]:
+    """GET /flows: every flow with its input model as JSON Schema (the console's Run with parameters form), whether a
+    schedule may start it, and which crews it runs (a crew's test run replays these flows' runs)."""
+    from ..crews.config import registry
+
+    crews: dict[str, list[str]] = {}
+    for c in registry().values():
+        for f in c.replay:
+            crews.setdefault(f, []).append(c.crew)
+    return [
+        {
+            "name": name,
+            "inputs_schema": spec.input_model.model_json_schema(),
+            "approval_only": name in APPROVAL_ONLY,
+            "schedulable": name in CRON_FLOWS,
+            "mcp": name in MCP_KICKOFF_ALLOWLIST,
+            "crews": crews.get(name, []),
+        }
+        for name, spec in SPECS.items()
+    ]

@@ -73,6 +73,7 @@ class WebApp(Protocol):
     async def news_notify(self, body: dict[str, Any]) -> dict[str, Any]: ...
     async def news_collect_performance(self) -> dict[str, Any]: ...
     async def agent_skills(self) -> list[dict[str, Any]]: ...
+    async def crew_configs(self) -> list[dict[str, Any]]: ...
     async def run_history_settings(self) -> dict[str, Any]: ...
 
 
@@ -241,6 +242,10 @@ class HttpWebApp:
     async def agent_skills(self) -> list[dict[str, Any]]:
         """The enabled agent skills (D-96, app/crews/skills.py), read before every crew run."""
         return list((await self._req("GET", "/skills")).get("skills") or [])
+
+    async def crew_configs(self) -> list[dict[str, Any]]:
+        """The active crew configuration versions (D-98, app/crews/config.py): [{crew, version, config}], before every crew run."""
+        return list((await self._req("GET", "/crew-configs")).get("crews") or [])
 
     async def run_history_settings(self) -> dict[str, Any]:
         """Run history settings (app/run_history.py): {"transcripts": bool}, whether model calls' prompts are kept."""

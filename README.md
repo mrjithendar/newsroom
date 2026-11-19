@@ -31,7 +31,7 @@ checkout, and are skipped when it's in neither place. CI has no moks-cms checkou
 choice), so run them locally before merging a change that touches the database, the callback API or shared constants.
 
 The Postgres tests need `SEO_AGENT_TEST_DATABASE_URL` (pgvector, PostgreSQL 18) or Docker for testcontainers. The CronJob test reads jithendar.com's
-`kubernetes/seo-agent-*-triggers.yaml` (`$SEO_AGENT_K8S_DIR` or `../jithendar.com`).
+`kubernetes/seo-agent-*.yaml` (`$SEO_AGENT_K8S_DIR` or `../jithendar.com`): one dispatcher CronJob, every minute.
 
 ## CI and release
 

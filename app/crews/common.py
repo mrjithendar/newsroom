@@ -306,6 +306,8 @@ class AgentDef:
     backstory: str
     tools: list[str]
     max_tokens: int | None = None  # None: DEFAULT_MAX_TOKENS, or long_output_tokens() for LONG_OUTPUT_AGENTS
+    model: str | None = None  # the crew configuration's model for this agent (crews/config.py); None: the settings
+    max_iter: int | None = None  # the crew configuration's iteration limit; None: CREW_MAX_ITER(S)
 
 
 def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: asyncio.AbstractEventLoop, run: CrewRun, tools_ctx: ToolContext, *, draft_id: str | None, purpose: str, prompt_version: str, crew: str, models: dict[str, str] | None = None, default_model: str | None = None) -> dict[str, Any]:
@@ -316,8 +318,9 @@ def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: async
     for d in defs:
         specs = build_tools(d.tools, tools_ctx)  # refuses anything outside the allowlist
         tools = [ToolClass(name=s.name, description=s.description).bind(s, loop, run) for s in specs]
-        # Per-agent model: a per-run override (brief.models), then SEO_CREW_MODELS "<crew>.<agent>", then the crew default.
-        model = (models or {}).get(d.key) or settings.crew_models.get(f"{crew}.{d.key}") or default_model or settings.draft_model
+        # Per-agent model: a per-run override (brief.models), then the crew configuration's (crews/config.py), then
+        # SEO_CREW_MODELS "<crew>.<agent>", then the crew default.
+        model = (models or {}).get(d.key) or d.model or settings.crew_models.get(f"{crew}.{d.key}") or default_model or settings.draft_model
         max_tokens = d.max_tokens or (long_output_tokens(settings) if d.key in LONG_OUTPUT_AGENTS else DEFAULT_MAX_TOKENS)
         agent_llm = LLMClass(model=model, max_tokens=max_tokens).bind(llm, loop, run, draft_id, purpose, prompt_version, agent=d.key)
         chosen = agent_skills.select(run.skills, crew, d.key, run.tags)
@@ -332,7 +335,7 @@ def build_agents(defs: list[AgentDef], settings: Settings, llm: Llm, loop: async
             llm=agent_llm,
             allow_delegation=False,
             allow_code_execution=False,
-            max_iter=settings.crew_max_iters.get(f"{crew}.{d.key}") or settings.crew_max_iter,
+            max_iter=d.max_iter or settings.crew_max_iters.get(f"{crew}.{d.key}") or settings.crew_max_iter,
             max_rpm=settings.crew_max_rpm,
             max_execution_time=max(30, settings.crew_timeout_s // 2),
             max_retry_limit=1,

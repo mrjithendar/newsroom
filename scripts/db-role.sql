@@ -78,6 +78,10 @@ GRANT SELECT, INSERT, UPDATE ON
   news_articles, news_clusters, news_images, news_models, news_run_steps, news_runs
   TO seo_agent;
 GRANT SELECT, INSERT, UPDATE, DELETE ON news_candidates, news_items TO seo_agent;
+-- Schedules for the CrewAI console (app/schedules.py; moks-cms migration 0037): an admin edits them in the web app; the
+-- dispatcher reads them and records each fire on the row (these five columns only).
+GRANT SELECT ON seo_flow_schedules TO seo_agent;
+GRANT UPDATE (last_slot, last_fired_at, last_status, last_run_id, last_error) ON seo_flow_schedules TO seo_agent;
 -- Run history for the admin's CrewAI console (app/run_history.py; moks-cms migration 0036): the step list, the log
 -- (append only) and model-call transcripts. The web app's retention job deletes old lines and transcripts.
 GRANT SELECT, INSERT, UPDATE ON seo_flow_run_steps TO seo_agent;
