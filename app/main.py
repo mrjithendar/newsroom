@@ -54,6 +54,7 @@ from .lance_admin import LanceAdmin, LanceError
 from .lance_admin import from_env as lance_from_env
 from .lance_index import ArticleMirror, fetch_from
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
+from .llm_limits import PgLimits
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
 from .run_history import MemoryHistorySink, PgHistorySink, RecordingLlm, RunHistory
@@ -206,7 +207,7 @@ async def build_container(settings: Settings) -> Container:
     pool = AsyncConnectionPool(settings.database_url, min_size=1, max_size=6, open=False, kwargs=kw)
     await pool.open(wait=True, timeout=30)
     sync_pool = ConnectionPool(settings.database_url, min_size=1, max_size=2, open=True, kwargs=kw)  # CrewAI persistence
-    guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd)
+    guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd, limits=PgLimits(pool))
     web = HttpWebApp(settings.callback_url, settings.callback_token)
     history = RunHistory(PgHistorySink(pool), web.run_history_settings)
     llm = RecordingLlm(AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s), history)
