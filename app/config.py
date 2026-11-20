@@ -7,6 +7,7 @@ Kubernetes Secrets and are never logged, returned by an endpoint or put into a p
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # Third-party telemetry off before crewai is imported anywhere (crewai_core 1.15.30 reads these at import/first use).
@@ -73,8 +74,8 @@ DEFAULT_DOCS_ALLOWLIST = (
 )
 
 
-def _bool(name: str, default: bool) -> bool:
-    v = os.environ.get(name, "").strip().lower()
+def _bool(name: str, default: bool, env: Mapping[str, str] | None = None) -> bool:
+    v = (os.environ if env is None else env).get(name, "").strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
     if v in ("0", "false", "no", "off"):
@@ -82,17 +83,17 @@ def _bool(name: str, default: bool) -> bool:
     return default
 
 
-def _float(name: str, default: float) -> float:
+def _float(name: str, default: float, env: Mapping[str, str] | None = None) -> float:
     try:
-        v = float(os.environ.get(name, ""))
+        v = float((os.environ if env is None else env).get(name, ""))
         return v if v >= 0 else default
     except ValueError:
         return default
 
 
-def _int(name: str, default: int) -> int:
+def _int(name: str, default: int, env: Mapping[str, str] | None = None) -> int:
     try:
-        v = int(os.environ.get(name, ""))
+        v = int((os.environ if env is None else env).get(name, ""))
         return v if v >= 0 else default
     except ValueError:
         return default
@@ -203,10 +204,13 @@ def embeddings_model_name(provider: str, model_dir: str, ollama_model: str) -> s
     return provider
 
 
-def load_settings() -> Settings:
+def load_settings(env: Mapping[str, str] | None = None) -> Settings:
+    """`env` defaults to the process environment. The admin settings store (app/admin_settings) passes the
+    environment with the admin's saved values laid over it, so a saved value wins over the deployment's and every
+    clamp below applies to both."""
     from .calibration import calibration_for
 
-    env = os.environ
+    env = os.environ if env is None else env
     docs = tuple(h.strip().lower() for h in env.get("SEO_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
     provider = env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx"
     model_dir = env.get("EMBEDDINGS_MODEL_DIR", Settings.embeddings_model_dir)
@@ -221,44 +225,44 @@ def load_settings() -> Settings:
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", ""),
         draft_model=env.get("SEO_DRAFT_MODEL", "").strip() or Settings.draft_model,
         classify_model=env.get("SEO_CLASSIFY_MODEL", "").strip() or Settings.classify_model,
-        monthly_budget_usd=_float("SEO_LLM_MONTHLY_BUDGET_USD", Settings.monthly_budget_usd),
-        ask_daily_budget_usd=_float("ASK_BLOG_DAILY_BUDGET_USD", Settings.ask_daily_budget_usd),
-        ask_enabled=_bool("ASK_BLOG_ENABLED", False),
-        lancedb_article_index=_bool("LANCEDB_ARTICLE_INDEX", True),
-        crew_max_tokens_per_run=_int("CREW_MAX_TOKENS_PER_RUN", Settings.crew_max_tokens_per_run),
-        crew_timeout_s=_int("CREW_TIMEOUT_SECONDS", Settings.crew_timeout_s),
-        crew_max_iter=_int("CREW_MAX_ITER", Settings.crew_max_iter),
-        crew_max_rpm=max(1, _int("CREW_MAX_RPM", Settings.crew_max_rpm)),
+        monthly_budget_usd=_float("SEO_LLM_MONTHLY_BUDGET_USD", Settings.monthly_budget_usd, env),
+        ask_daily_budget_usd=_float("ASK_BLOG_DAILY_BUDGET_USD", Settings.ask_daily_budget_usd, env),
+        ask_enabled=_bool("ASK_BLOG_ENABLED", False, env),
+        lancedb_article_index=_bool("LANCEDB_ARTICLE_INDEX", True, env),
+        crew_max_tokens_per_run=_int("CREW_MAX_TOKENS_PER_RUN", Settings.crew_max_tokens_per_run, env),
+        crew_timeout_s=_int("CREW_TIMEOUT_SECONDS", Settings.crew_timeout_s, env),
+        crew_max_iter=_int("CREW_MAX_ITER", Settings.crew_max_iter, env),
+        crew_max_rpm=max(1, _int("CREW_MAX_RPM", Settings.crew_max_rpm, env)),
         crew_models=_models(env.get("SEO_CREW_MODELS", "")),
         crew_max_iters=_max_iters(env.get("SEO_CREW_MAX_ITERS", "")),
-        llm_timeout_s=max(30.0, min(900.0, _float("SEO_LLM_TIMEOUT_SECONDS", Settings.llm_timeout_s))),
-        fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency)),
-        weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles),
+        llm_timeout_s=max(30.0, min(900.0, _float("SEO_LLM_TIMEOUT_SECONDS", Settings.llm_timeout_s, env))),
+        fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency, env)),
+        weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles, env),
         embeddings_provider=provider,
         embeddings_model_dir=model_dir,
         ollama_url=env.get("OLLAMA_URL", "").rstrip("/"),
         ollama_model=ollama_model,
-        ollama_embed_dim=max(0, _int("OLLAMA_EMBED_DIM", 0)),
-        embeddings_timeout_s=max(10.0, min(1800.0, _float("EMBEDDINGS_TIMEOUT_SECONDS", Settings.embeddings_timeout_s))),
+        ollama_embed_dim=max(0, _int("OLLAMA_EMBED_DIM", 0, env)),
+        embeddings_timeout_s=max(10.0, min(1800.0, _float("EMBEDDINGS_TIMEOUT_SECONDS", Settings.embeddings_timeout_s, env))),
         embeddings_api_url=env.get("EMBEDDINGS_API_URL", ""),
         embeddings_api_key=env.get("EMBEDDINGS_API_KEY", ""),
         docs_allowlist=docs or DEFAULT_DOCS_ALLOWLIST,
-        ask_cache_ttl_s=_int("ASK_BLOG_CACHE_TTL_SECONDS", Settings.ask_cache_ttl_s),
-        ask_top_k=max(1, min(12, _int("ASK_BLOG_TOP_K", Settings.ask_top_k))),
-        ask_min_score=max(0.0, min(0.95, _float("ASK_BLOG_MIN_SCORE", floor))),
-        ask_retention_days=_int("ASK_BLOG_RETENTION_DAYS", Settings.ask_retention_days),
+        ask_cache_ttl_s=_int("ASK_BLOG_CACHE_TTL_SECONDS", Settings.ask_cache_ttl_s, env),
+        ask_top_k=max(1, min(12, _int("ASK_BLOG_TOP_K", Settings.ask_top_k, env))),
+        ask_min_score=max(0.0, min(0.95, _float("ASK_BLOG_MIN_SCORE", floor, env))),
+        ask_retention_days=_int("ASK_BLOG_RETENTION_DAYS", Settings.ask_retention_days, env),
         production=env.get("APP_ENV", "") == "production",
         otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
         service_name=env.get("OTEL_SERVICE_NAME", "seo-agent"),
         site_url=(env.get("SITE_URL", "").strip() or Settings.site_url).rstrip("/"),
-        public_mcp_enabled=_bool("PUBLIC_MCP_ENABLED", False),
-        admin_mcp_enabled=_bool("ADMIN_MCP_ENABLED", False),
-        edge_port=_int("SEO_AGENT_EDGE_PORT", Settings.edge_port),
+        public_mcp_enabled=_bool("PUBLIC_MCP_ENABLED", False, env),
+        admin_mcp_enabled=_bool("ADMIN_MCP_ENABLED", False, env),
+        edge_port=_int("SEO_AGENT_EDGE_PORT", Settings.edge_port, env),
         mcp_allowed_hosts=tuple(h.strip().lower() for h in env.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()) or Settings.mcp_allowed_hosts,
-        public_mcp_rpm_per_ip=max(1, _int("PUBLIC_MCP_RPM_PER_IP", Settings.public_mcp_rpm_per_ip)),
-        public_mcp_daily_calls=_int("PUBLIC_MCP_DAILY_CALLS", Settings.public_mcp_daily_calls),
-        admin_mcp_rpm_per_token=max(1, _int("ADMIN_MCP_RPM_PER_TOKEN", Settings.admin_mcp_rpm_per_token)),
-        admin_kickoffs_per_hour=max(1, _int("ADMIN_MCP_KICKOFFS_PER_HOUR", Settings.admin_kickoffs_per_hour)),
-        flow_timeout_s=max(60, _int("SEO_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s)),
-        schedule_catchup_min=max(2, min(1440, _int("SCHEDULE_CATCHUP_MINUTES", Settings.schedule_catchup_min))),
+        public_mcp_rpm_per_ip=max(1, _int("PUBLIC_MCP_RPM_PER_IP", Settings.public_mcp_rpm_per_ip, env)),
+        public_mcp_daily_calls=_int("PUBLIC_MCP_DAILY_CALLS", Settings.public_mcp_daily_calls, env),
+        admin_mcp_rpm_per_token=max(1, _int("ADMIN_MCP_RPM_PER_TOKEN", Settings.admin_mcp_rpm_per_token, env)),
+        admin_kickoffs_per_hour=max(1, _int("ADMIN_MCP_KICKOFFS_PER_HOUR", Settings.admin_kickoffs_per_hour, env)),
+        flow_timeout_s=max(60, _int("SEO_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s, env)),
+        schedule_catchup_min=max(2, min(1440, _int("SCHEDULE_CATCHUP_MINUTES", Settings.schedule_catchup_min, env))),
     )
