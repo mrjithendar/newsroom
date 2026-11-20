@@ -21,12 +21,13 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
 from . import metrics, tracing
+from .llm_limits import Limit, LimitsSource
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -118,6 +119,7 @@ class Truncated(InvalidOutput):
 class SpendStore(Protocol):
     async def month_spend(self, now: datetime) -> float: ...
     async def day_spend(self, now: datetime, purpose_prefix: str) -> float: ...
+    async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float: ...
     async def record(self, row: dict[str, Any]) -> None: ...
 
 
@@ -145,6 +147,24 @@ class PgSpendStore:
                 (start, f"{purpose_prefix}%"),
             )
             return float((await cur.fetchone())["s"])
+
+    async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float:
+        """Every purpose since `since`, for one model or one provider (app/llm_limits.py), plus legacy batches still in
+        flight at their estimate (they are Anthropic batches). Counted the way the web app counts it
+        (moks-cms/src/lib/llm-budgets.ts)."""
+        async with self.pool.connection() as c:
+            cur = await c.execute(
+                "select coalesce(sum(cost_usd), 0)::float8 as s from seo_llm_usage where at >= %s"
+                " and (%s::text is null or model = %s) and (%s::text is null or provider = %s)",
+                (since, model, model, provider, provider),
+            )
+            spent = float((await cur.fetchone())["s"])
+            cur = await c.execute(
+                "select coalesce(sum(estimated_cost_usd), 0)::float8 as s from seo_llm_batches where status = 'in_progress'"
+                " and (%s::text is null or model = %s) and (%s::text is null or %s = 'anthropic')",
+                (model, model, provider, provider),
+            )
+            return spent + float((await cur.fetchone())["s"])
 
     _attribution: bool | None = None  # seo_llm_usage has run_id/agent (web app migration 0022); checked once
 
@@ -186,6 +206,11 @@ class MemorySpendStore:
     async def day_spend(self, now: datetime, purpose_prefix: str) -> float:
         return sum(r["cost_usd"] for r in self.rows if r["purpose"].startswith(purpose_prefix))
 
+    async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float:
+        """Rows without an `at` count as now. Every row here is an Anthropic call."""
+        rows = [r for r in self.rows if r.get("at", since) >= since and (model is None or r["model"] == model) and provider in (None, "anthropic")]
+        return sum(r["cost_usd"] for r in rows)
+
     async def record(self, row: dict[str, Any]) -> None:
         self.rows.append(row)
 
@@ -197,6 +222,20 @@ class Reservation:
     scope: str | None  # "monthly" | "ask_daily" | None (news: its own caps)
     usd: float
     released: bool = False
+    model: str | None = None  # held against the model's and the provider's limits too (app/llm_limits.py)
+
+
+PROVIDER = "anthropic"  # every call this service makes is a Claude call (seo_llm_usage.provider)
+
+
+def _period_start(unit: str, now: datetime) -> datetime:
+    return datetime(now.year, now.month, now.day, tzinfo=UTC) if unit == "day" else datetime(now.year, now.month, 1, tzinfo=UTC)
+
+
+def _period_end(unit: str, now: datetime) -> datetime:
+    if unit == "day":
+        return _period_start("day", now) + timedelta(days=1)
+    return datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
 
 
 class BudgetGuard:
@@ -208,13 +247,22 @@ class BudgetGuard:
     one replica; a cross-replica reservation would need a row lock or an advisory lock on the shared table).
     """
 
-    def __init__(self, store: SpendStore, monthly_usd: float, ask_daily_usd: float, clock: Callable[[], datetime] | None = None):
+    def __init__(
+        self,
+        store: SpendStore,
+        monthly_usd: float,
+        ask_daily_usd: float,
+        clock: Callable[[], datetime] | None = None,
+        limits: LimitsSource | None = None,
+    ):
         self.store = store
         self.monthly_usd = monthly_usd
         self.ask_daily_usd = ask_daily_usd
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.limits = limits
         self._lock = asyncio.Lock()
         self.pending: dict[str, float] = {"monthly": 0.0, "ask_daily": 0.0}
+        self.pending_models: dict[str, float] = {}  # in-flight estimates per model, for the LLM budgets
 
     @staticmethod
     def _scope(purpose: str) -> str | None:
@@ -222,36 +270,76 @@ class BudgetGuard:
             return None  # the news desk has its own per-job and global caps (app/news/budget.py), checked before every call
         return "ask_daily" if purpose.startswith("ask") else "monthly"
 
+    async def _llm_limits(self, model: str) -> tuple[Limit | None, Limit | None]:
+        if self.limits is None:
+            return None, None
+        lims = await self.limits.limits()
+        return lims.model(model), lims.provider(PROVIDER)
+
+    async def _check_llm_limits(self, model: str, est: float, now: datetime, own: Limit | None, total: Limit | None) -> None:
+        """The model's and the provider's own limits (Admin → Automation & AI → LLM budgets), across every purpose:
+        spend this UTC day or month, plus the calls in flight here, plus this call's upper bound. Under the lock."""
+        checks = ((own, f"The {{unit}} budget of {model}", {"model": model}, self.pending_models.get(model, 0.0)),
+                  (total, f"The {{unit}} total for all {PROVIDER} models", {"provider": PROVIDER}, sum(self.pending_models.values())))
+        for lim, label, by, pending in checks:
+            if lim is None:
+                continue
+            for unit, max_usd in (("day", lim.daily_usd), ("month", lim.monthly_usd)):
+                if max_usd is None:
+                    continue
+                used = await self.store.llm_spend(_period_start(unit, now), **by) + pending
+                if used + est > max_usd or (used > 0 and used >= max_usd):
+                    word = "daily" if unit == "day" else "monthly"
+                    scope = f"llm_{'model' if 'model' in by else 'provider'}_{word}"
+                    metrics.BUDGET_BLOCKED.labels(scope=scope).inc()
+                    more = f", and this call could cost up to ${est:.2f}" if used < max_usd else ""
+                    reset = _period_end(unit, now).strftime("%Y-%m-%d %H:%M UTC")
+                    raise BudgetExceeded(scope, f"{label.format(unit=word)} is reached: ${used:.2f} of ${max_usd:.2f} used {'today' if unit == 'day' else 'this month'}{more}."
+                                                f" It resets {reset}; change it in Admin → Automation & AI → LLM budgets.")
+
     async def _admit(self, model: str, input_chars: int, max_tokens: int, purpose: str, hold: bool) -> Reservation:
         est = estimate_cost_usd(model, input_chars, max_tokens)
         scope = self._scope(purpose)
-        if scope is None:
+        own, total = await self._llm_limits(model)
+        if scope is None and own is None and total is None:
             return Reservation(None, 0.0, released=True)
         async with self._lock:
             now = self.clock()
+            if own is not None or total is not None:
+                await self._check_llm_limits(model, est, now, own, total)
             if scope == "monthly":
                 month = await self.store.month_spend(now)
                 if month + self.pending["monthly"] + est > self.monthly_usd:
                     metrics.BUDGET_BLOCKED.labels(scope="monthly").inc()
                     raise BudgetExceeded("monthly", f"monthly LLM budget ${self.monthly_usd:.2f} would be exceeded (spent ${month:.2f})")
-            else:
+            elif scope == "ask_daily":
                 day = await self.store.day_spend(now, "ask")
                 if day + self.pending["ask_daily"] + est > self.ask_daily_usd:
                     metrics.BUDGET_BLOCKED.labels(scope="ask_daily").inc()
                     raise BudgetExceeded("ask_daily", f"daily Ask-the-Blog budget ${self.ask_daily_usd:.2f} reached")
             if not hold:
                 return Reservation(scope, 0.0, released=True)
-            self.pending[scope] += est
-            return Reservation(scope, est)
+            if scope is not None:
+                self.pending[scope] += est
+            self.pending_models[model] = self.pending_models.get(model, 0.0) + est
+            return Reservation(scope, est, model=model)
 
     async def ensure(self, model: str, input_chars: int, max_tokens: int, purpose: str) -> None:
         """Check only (no reservation): would this call fit under its cap, counting the calls in flight?"""
         await self._admit(model, input_chars, max_tokens, purpose, hold=False)
 
     def release(self, r: Reservation) -> None:
-        if not r.released and r.scope is not None:
-            r.released = True
+        if r.released:
+            return
+        r.released = True
+        if r.scope is not None:
             self.pending[r.scope] = max(0.0, self.pending[r.scope] - r.usd)
+        if r.model is not None:
+            left = self.pending_models.get(r.model, 0.0) - r.usd
+            if left > 1e-12:
+                self.pending_models[r.model] = left
+            else:
+                self.pending_models.pop(r.model, None)
 
     @asynccontextmanager
     async def reserve(self, model: str, input_chars: int, max_tokens: int, purpose: str) -> AsyncIterator[Reservation]:
