@@ -17,6 +17,8 @@ Every endpoint except /healthz, /readyz and /metrics needs `Authorization: Beare
     GET  /budget
     GET  /llm-budgets                   limits per model and provider, spend today and this month (app/llm_budgets.py)
     PUT  /llm-budgets                   {models, providers, actor} → the whole set, or 422
+    GET  /admin-settings                settings an admin may change: schema, effective values, source, restart pending
+    PUT  /admin-settings/{group}        {values, actor} → one group, validated, all or nothing (app/admin_settings)
     GET  /healthz /readyz /metrics
 
 publish_flow cannot be started through /flows/{name}/kickoff (403): only /review/{id}/decision with an approval.
@@ -39,6 +41,12 @@ from prometheus_client import generate_latest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import metrics
+from .admin_settings import MemorySettingsStore, PgSettingsStore, SettingsInvalid, UnknownGroup
+from .admin_settings import overview as settings_overview
+from .admin_settings import save_group as save_settings_group
+from .admin_settings.store import REFRESH_SECONDS as SETTINGS_REFRESH_SECONDS
+from .admin_settings.store import apply_live as apply_live_settings
+from .admin_settings.store import effective as effective_settings
 from .ask import AskService, MemoryAskLog, PgAskLog
 from .ask_runtime import PgAskRuntime, StaticAskRuntime
 from .config import Settings, load_settings
@@ -139,6 +147,7 @@ class Container:
     schedules: Any = field(default_factory=MemoryScheduleStore)  # seo_flow_schedules (app/schedules.py)
     clock: Callable[[], Any] | None = None  # tests: the dispatcher's "now"
     budgets: Any = field(default_factory=MemoryBudgets)  # LLM budgets per model and provider (app/llm_budgets.py)
+    admin_settings: Any = field(default_factory=MemorySettingsStore)  # values saved from the admin (app/admin_settings)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
@@ -211,13 +220,24 @@ async def build_container(settings: Settings) -> Container:
     pool = AsyncConnectionPool(settings.database_url, min_size=1, max_size=6, open=False, kwargs=kw)
     await pool.open(wait=True, timeout=30)
     sync_pool = ConnectionPool(settings.database_url, min_size=1, max_size=2, open=True, kwargs=kw)  # CrewAI persistence
+    # Values an admin saved win over the environment (app/admin_settings). Read before anything below is built, so
+    # components that copy a value at start-up (timeouts) get the saved one. The connection itself always comes
+    # from the environment: none of its settings can be saved from the admin.
+    admin_settings = PgSettingsStore(pool)
+    settings_note: str | None = None
+    try:
+        await admin_settings.ensure_schema()
+        settings = effective_settings(await admin_settings.load(fresh=True))
+    except Exception as e:  # the role cannot create the table, or the database is down: the deployment's values
+        settings_note = f"admin settings table not available: {type(e).__name__}"
+        log.warning("admin settings not loaded", extra={"event": "admin_settings_load_failed"})
     budgets = PgBudgets(pool)
     guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd, limits=budgets)
     web = HttpWebApp(settings.callback_url, settings.callback_token)
     history = RunHistory(PgHistorySink(pool), web.run_history_settings)
     llm = RecordingLlm(AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s), history)
     index = PgVectorIndex(pool, make_embeddings(settings))
-    reasons: list[str] = []
+    reasons: list[str] = [settings_note] if settings_note else []
     try:
         await index.ensure_schema()
         if not index.available:
@@ -233,7 +253,7 @@ async def build_container(settings: Settings) -> Container:
     deps.runner = runner
     # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), budgets=budgets)
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), budgets=budgets, admin_settings=admin_settings)
     c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
     c.mirror = ArticleMirror(c.lance, fetch_from(pool), enabled=settings.lancedb_article_index)
     deps.reindex = c.reindex
@@ -343,6 +363,18 @@ async def _gauges(c: Container) -> None:
         await asyncio.sleep(60)
 
 
+async def _settings_refresh(c: Container) -> None:
+    """Live settings saved through another replica (or straight in the table) reach this process within one period."""
+    while True:
+        await asyncio.sleep(SETTINGS_REFRESH_SECONDS)
+        try:
+            changed = apply_live_settings(c.settings, await c.admin_settings.load())
+            if changed:
+                log.info("admin settings applied", extra={"event": "admin_settings_applied", "settings": changed})
+        except Exception:  # noqa: S110 - the next period tries again; the running values stay
+            pass
+
+
 async def startup(c: Container) -> None:
     mode = getattr(getattr(c.index, "config", None), "mode", "vector")
     for m in metrics.RAG_MODES:
@@ -359,6 +391,7 @@ async def startup(c: Container) -> None:
         log.warning("run recovery failed", extra={"event": "recover_failed"})
     c.ready = True
     c.bg.append(asyncio.create_task(_gauges(c)))
+    c.bg.append(asyncio.create_task(_settings_refresh(c)))
     if c.history is not None:  # started here, outside any run, so the writer's own log lines never enter a run's log
         install_run_log(c.history)
         c.bg.append(asyncio.create_task(c.history.run_forever()))
@@ -553,6 +586,27 @@ def create_app(container: Container | None = None) -> FastAPI:
         saved = await c.budgets.save(body.limits(), body.actor)
         log.info("llm budgets saved", extra={"event": "llm_budgets_saved", "models": len(saved.models), "providers": len(saved.providers)})
         return {"budgets": saved.out()}
+
+    @app.get("/admin-settings", dependencies=[Depends(auth)])
+    async def admin_settings(request: Request) -> dict[str, Any]:
+        c = ctr(request)
+        return settings_overview(await c.admin_settings.load(fresh=True), c.settings)
+
+    @app.put("/admin-settings/{group}", dependencies=[Depends(auth)])
+    async def save_admin_settings(group: str, request: Request) -> Any:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "send a JSON object"}, status_code=422)
+        c = ctr(request)
+        try:
+            return await save_settings_group(c.admin_settings, c.settings, group, body.get("values"), body.get("actor"))
+        except UnknownGroup:
+            return JSONResponse({"error": "no such settings group"}, status_code=404)
+        except SettingsInvalid as e:
+            return JSONResponse({"error": "the settings are not valid", "issues": e.issues}, status_code=422)
 
     return app
 

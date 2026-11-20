@@ -33,6 +33,45 @@ choice), so run them locally before merging a change that touches the database, 
 The Postgres tests need `SEO_AGENT_TEST_DATABASE_URL` (pgvector, PostgreSQL 18) or Docker for testcontainers. The CronJob test reads jithendar.com's
 `kubernetes/seo-agent-*.yaml` (`$SEO_AGENT_K8S_DIR` or `../jithendar.com`): one dispatcher CronJob, every minute.
 
+## Settings an admin can change
+
+Some settings can be changed from the web app (Admin → AI & SEO → Settings) instead of the deployment's environment.
+They live in `app/admin_settings/`:
+
+- **Precedence**: the admin's saved value, then the environment variable, then the default in `app/config.py`. With
+  nothing saved, the agent behaves exactly as before.
+- **Storage**: the agent's own table `seo_agent_settings` (key = the environment-variable name), created at start-up
+  like `seo_agent_llm_budgets`. No moks-cms migration.
+- **API** (internal token): `GET /admin-settings` returns every group with its fields, the effective value, where it
+  comes from (`admin`, `deployment`, `default`) and whether a restart is pending. `PUT /admin-settings/{group}` takes
+  `{"values": {"ENV_NAME": value}, "actor": "..."}`; a field that is not sent stays as it is, and `null`, `""` or `[]`
+  clears it. One invalid field refuses the whole save (422 with `issues`).
+- **Live or restart**: a `live` field applies at once in this process and within 30 seconds in any other. A `restart`
+  field is stored and reported as "restart pending" until the agent restarts.
+- **Secrets** are sealed with `SEO_AGENT_SETTINGS_KEY` (32 characters or more; `openssl rand -base64 32`) using the
+  same scheme as moks-cms `src/lib/secrets.ts`, with its own key. They are never returned: the API says only whether
+  one is set. Without the key, secret fields cannot be saved ("Requires manual configuration"). Rotating the key
+  makes stored secrets unreadable.
+- **Never registered** (the agent could not start, or the admin could lock itself out): `DATABASE_URL`,
+  `SEO_AGENT_DATABASE_URL`, `SEO_AGENT_TOKEN`, `SEO_AGENT_CALLBACK_TOKEN`, `SEO_AGENT_CALLBACK_URL`,
+  `SEO_AGENT_SETTINGS_KEY`, `OTEL_*`, `SITE_URL`. The registry refuses them and a test checks it.
+
+### How to add a settings group
+
+1. Add `app/admin_settings/groups/<group>.py` with one `GROUP = Group(id, title, description, fields=(...))`. Each
+   `Field` names the environment variable, the `Settings` attribute it feeds (`attr`), a label, a plain hint, a type
+   (`text`, `integer`, `number`, `boolean`, `select`, `list`, `secret`), and where they apply a unit, `min`/`max`,
+   `options` or a `pattern`. Ranges should match the clamps in `app/config.py`: they refuse a value, they do not set
+   one.
+2. Append the group to `GROUPS` in `app/admin_settings/groups/__init__.py` (append only: one module per group so
+   parallel changes do not collide).
+3. Decide `apply` by reading the code: `live` only if every reader takes the value from the shared `Settings` object
+   at the time it uses it (`deps.settings.x`, `c.settings.x`). If anything copies it when it is built (a client's
+   timeout, a pool size), use `restart`.
+4. Nothing else changes: `app/config.py` already parses the variable, and the store lays the saved value over the
+   environment before `load_settings` runs.
+5. Add the group's fields to `tests/test_admin_settings.py` (which are live, which need a restart).
+
 ## CI and release
 
 - `.github/workflows/ci.yml` runs on pull requests. It runs lint, types, tests (without the moks-cms contract tests)
