@@ -15,6 +15,8 @@ Every endpoint except /healthz, /readyz and /metrics needs `Authorization: Beare
     POST /review/{draft_id}/decision    {approve|reject|regenerate, approval_id, accepted_change_ids, edits, feedback}
     POST /ask                           public RAG, proxied by the web app (rate-limited there)
     GET  /budget
+    GET  /llm-budgets                   limits per model and provider, spend today and this month (app/llm_budgets.py)
+    PUT  /llm-budgets                   {models, providers, actor} → the whole set, or 422
     GET  /healthz /readyz /metrics
 
 publish_flow cannot be started through /flows/{name}/kickoff (403): only /review/{id}/decision with an approval.
@@ -34,7 +36,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import generate_latest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import metrics
 from .ask import AskService, MemoryAskLog, PgAskLog
@@ -54,7 +56,8 @@ from .lance_admin import LanceAdmin, LanceError
 from .lance_admin import from_env as lance_from_env
 from .lance_index import ArticleMirror, fetch_from
 from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
-from .llm_limits import PgLimits
+from .llm_budgets import BudgetsIn, MemoryBudgets, PgBudgets
+from .llm_budgets import overview as llm_overview
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
 from .run_history import MemoryHistorySink, PgHistorySink, RecordingLlm, RunHistory
@@ -135,6 +138,7 @@ class Container:
     history: RunHistory | None = None  # steps, log lines and model calls of every flow run (app/run_history.py)
     schedules: Any = field(default_factory=MemoryScheduleStore)  # seo_flow_schedules (app/schedules.py)
     clock: Callable[[], Any] | None = None  # tests: the dispatcher's "now"
+    budgets: Any = field(default_factory=MemoryBudgets)  # LLM budgets per model and provider (app/llm_budgets.py)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
@@ -207,7 +211,8 @@ async def build_container(settings: Settings) -> Container:
     pool = AsyncConnectionPool(settings.database_url, min_size=1, max_size=6, open=False, kwargs=kw)
     await pool.open(wait=True, timeout=30)
     sync_pool = ConnectionPool(settings.database_url, min_size=1, max_size=2, open=True, kwargs=kw)  # CrewAI persistence
-    guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd, limits=PgLimits(pool))
+    budgets = PgBudgets(pool)
+    guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd, limits=budgets)
     web = HttpWebApp(settings.callback_url, settings.callback_token)
     history = RunHistory(PgHistorySink(pool), web.run_history_settings)
     llm = RecordingLlm(AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s), history)
@@ -228,7 +233,7 @@ async def build_container(settings: Settings) -> Container:
     deps.runner = runner
     # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool))
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), budgets=budgets)
     c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
     c.mirror = ArticleMirror(c.lance, fetch_from(pool), enabled=settings.lancedb_article_index)
     deps.reindex = c.reindex
@@ -255,7 +260,9 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     deps.runner = runner
     guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))
     ask = AskService(AskPipeline(deps), retriever, MemoryAskLog(), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=StaticAskRuntime(), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True, history=run_history)
+    budgets = guard.limits if isinstance(guard.limits, MemoryBudgets) else MemoryBudgets()
+    guard.limits = budgets
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True, history=run_history, budgets=budgets)
     deps.reindex = c.reindex
     return c
 
@@ -340,6 +347,11 @@ async def startup(c: Container) -> None:
     mode = getattr(getattr(c.index, "config", None), "mode", "vector")
     for m in metrics.RAG_MODES:
         metrics.RAG_RETRIEVAL_MODE.labels(mode=m).set(1 if m == mode else 0)
+    try:
+        await c.budgets.ensure_schema()
+    except Exception as e:  # the role cannot create it, or the database is down: no LLM budgets until it can
+        c.reasons.append(f"LLM budgets table not available: {type(e).__name__}")
+        log.warning("llm budgets schema failed", extra={"event": "llm_budgets_schema_failed"})
     try:
         await c.runner.recover()
     except Exception as e:  # e.g. the web app's migration 0016 not applied yet: start, report on /readyz
@@ -522,6 +534,25 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.get("/budget", dependencies=[Depends(auth)])
     async def budget(request: Request) -> dict[str, float]:
         return await ctr(request).guard.status()
+
+    @app.get("/llm-budgets", dependencies=[Depends(auth)])
+    async def llm_budgets(request: Request) -> dict[str, Any]:
+        c = ctr(request)
+        return await llm_overview(await c.budgets.limits(), c.guard.store, c.guard.clock())
+
+    @app.put("/llm-budgets", dependencies=[Depends(auth)])
+    async def save_llm_budgets(request: Request) -> Any:
+        try:
+            body = BudgetsIn.model_validate(await request.json())
+        except ValidationError as e:
+            issues = [f"{'.'.join(str(p) for p in err['loc']) or 'body'}: {err['msg']}" for err in e.errors()][:30]
+            return JSONResponse({"error": "the LLM budgets are not valid", "issues": issues}, status_code=422)
+        except ValueError:
+            return JSONResponse({"error": "send a JSON object"}, status_code=422)
+        c = ctr(request)
+        saved = await c.budgets.save(body.limits(), body.actor)
+        log.info("llm budgets saved", extra={"event": "llm_budgets_saved", "models": len(saved.models), "providers": len(saved.providers)})
+        return {"budgets": saved.out()}
 
     return app
 

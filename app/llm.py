@@ -21,13 +21,13 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
 from . import metrics, tracing
-from .llm_limits import Limit, LimitsSource
+from .llm_budgets import Limit, LimitsSource, period_end, period_start
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -120,6 +120,7 @@ class SpendStore(Protocol):
     async def month_spend(self, now: datetime) -> float: ...
     async def day_spend(self, now: datetime, purpose_prefix: str) -> float: ...
     async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float: ...
+    async def llm_spend_by_model(self, month_start: datetime, day_start: datetime) -> list[dict[str, Any]]: ...
     async def record(self, row: dict[str, Any]) -> None: ...
 
 
@@ -149,9 +150,8 @@ class PgSpendStore:
             return float((await cur.fetchone())["s"])
 
     async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float:
-        """Every purpose since `since`, for one model or one provider (app/llm_limits.py), plus legacy batches still in
-        flight at their estimate (they are Anthropic batches). Counted the way the web app counts it
-        (moks-cms/src/lib/llm-budgets.ts)."""
+        """Every purpose since `since`, for one model or one provider (app/llm_budgets.py), plus legacy batches still in
+        flight at their estimate (they are Anthropic batches)."""
         async with self.pool.connection() as c:
             cur = await c.execute(
                 "select coalesce(sum(cost_usd), 0)::float8 as s from seo_llm_usage where at >= %s"
@@ -165,6 +165,30 @@ class PgSpendStore:
                 (model, model, provider, provider),
             )
             return spent + float((await cur.fetchone())["s"])
+
+    async def llm_spend_by_model(self, month_start: datetime, day_start: datetime) -> list[dict[str, Any]]:
+        """This month's spend per provider and model, today's alongside, the purposes' first word, and legacy batches
+        in flight (counted today, as Anthropic spend). For GET /llm-budgets."""
+        async with self.pool.connection() as c:
+            cur = await c.execute(
+                "select provider, model, coalesce(sum(cost_usd) filter (where at >= %s), 0)::float8 as today,"
+                " coalesce(sum(cost_usd), 0)::float8 as month, count(*)::int as calls,"
+                " array_agg(distinct split_part(purpose, '.', 1)) as purposes"
+                " from seo_llm_usage where at >= %s group by provider, model",
+                (day_start, month_start),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            cur = await c.execute(
+                "select model, coalesce(sum(estimated_cost_usd), 0)::float8 as s from seo_llm_batches where status = 'in_progress' group by model"
+            )
+            batches = list(await cur.fetchall())
+        by_key = {(r["provider"], r["model"]): r for r in rows}
+        for b in batches:
+            r = by_key.setdefault(("anthropic", b["model"]), {"provider": "anthropic", "model": b["model"], "today": 0.0, "month": 0.0, "calls": 0, "purposes": []})
+            r["today"] += float(b["s"])
+            r["month"] += float(b["s"])
+            r["purposes"] = [*(r["purposes"] or []), "batch"]
+        return list(by_key.values())
 
     _attribution: bool | None = None  # seo_llm_usage has run_id/agent (web app migration 0022); checked once
 
@@ -211,6 +235,19 @@ class MemorySpendStore:
         rows = [r for r in self.rows if r.get("at", since) >= since and (model is None or r["model"] == model) and provider in (None, "anthropic")]
         return sum(r["cost_usd"] for r in rows)
 
+    async def llm_spend_by_model(self, month_start: datetime, day_start: datetime) -> list[dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for r in self.rows:
+            at = r.get("at", day_start)
+            if at < month_start:
+                continue
+            m = out.setdefault(r["model"], {"provider": "anthropic", "model": r["model"], "today": 0.0, "month": 0.0, "calls": 0, "purposes": []})
+            m["month"] += r["cost_usd"]
+            m["today"] += r["cost_usd"] if at >= day_start else 0.0
+            m["calls"] += 1
+            m["purposes"] = sorted({*m["purposes"], r["purpose"].split(".")[0]})
+        return list(out.values())
+
     async def record(self, row: dict[str, Any]) -> None:
         self.rows.append(row)
 
@@ -222,20 +259,11 @@ class Reservation:
     scope: str | None  # "monthly" | "ask_daily" | None (news: its own caps)
     usd: float
     released: bool = False
-    model: str | None = None  # held against the model's and the provider's limits too (app/llm_limits.py)
+    model: str | None = None  # held against the model's and the provider's limits too (app/llm_budgets.py)
 
 
 PROVIDER = "anthropic"  # every call this service makes is a Claude call (seo_llm_usage.provider)
 
-
-def _period_start(unit: str, now: datetime) -> datetime:
-    return datetime(now.year, now.month, now.day, tzinfo=UTC) if unit == "day" else datetime(now.year, now.month, 1, tzinfo=UTC)
-
-
-def _period_end(unit: str, now: datetime) -> datetime:
-    if unit == "day":
-        return _period_start("day", now) + timedelta(days=1)
-    return datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
 
 
 class BudgetGuard:
@@ -277,7 +305,7 @@ class BudgetGuard:
         return lims.model(model), lims.provider(PROVIDER)
 
     async def _check_llm_limits(self, model: str, est: float, now: datetime, own: Limit | None, total: Limit | None) -> None:
-        """The model's and the provider's own limits (Admin → Automation & AI → LLM budgets), across every purpose:
+        """The model's and the provider's own limits (app/llm_budgets.py), across every purpose:
         spend this UTC day or month, plus the calls in flight here, plus this call's upper bound. Under the lock."""
         checks = ((own, f"The {{unit}} budget of {model}", {"model": model}, self.pending_models.get(model, 0.0)),
                   (total, f"The {{unit}} total for all {PROVIDER} models", {"provider": PROVIDER}, sum(self.pending_models.values())))
@@ -287,13 +315,13 @@ class BudgetGuard:
             for unit, max_usd in (("day", lim.daily_usd), ("month", lim.monthly_usd)):
                 if max_usd is None:
                     continue
-                used = await self.store.llm_spend(_period_start(unit, now), **by) + pending
+                used = await self.store.llm_spend(period_start(unit, now), **by) + pending
                 if used + est > max_usd or (used > 0 and used >= max_usd):
                     word = "daily" if unit == "day" else "monthly"
                     scope = f"llm_{'model' if 'model' in by else 'provider'}_{word}"
                     metrics.BUDGET_BLOCKED.labels(scope=scope).inc()
                     more = f", and this call could cost up to ${est:.2f}" if used < max_usd else ""
-                    reset = _period_end(unit, now).strftime("%Y-%m-%d %H:%M UTC")
+                    reset = period_end(unit, now).strftime("%Y-%m-%d %H:%M UTC")
                     raise BudgetExceeded(scope, f"{label.format(unit=word)} is reached: ${used:.2f} of ${max_usd:.2f} used {'today' if unit == 'day' else 'this month'}{more}."
                                                 f" It resets {reset}; change it in Admin → Automation & AI → LLM budgets.")
 
