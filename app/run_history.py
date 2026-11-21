@@ -1,5 +1,7 @@
 """Run history for the admin's CrewAI console (/admin/crewai): the steps, log and model calls of every flow run.
 
+Forked from moks-seo-agent/app/run_history.py@bb9e553 on 2026-11-21.
+
 The web app owns the tables (moks-cms migration 0036): `seo_flow_run_steps`, `seo_flow_run_logs` and
 `seo_flow_run_calls`. Its run page reads them, streams the log while a run goes, and its daily retention job deletes old
 lines and transcripts (Automation & AI → settings → Run history). Like GitHub Actions: numbered runs (a trigger on
@@ -40,8 +42,8 @@ from pydantic import BaseModel
 from .logs import _RECORD_ATTRS
 from .runs import CURRENT_RUN_ID
 
-log = logging.getLogger("seo_agent.run_history")  # never copied into a run's log (no recursion)
-calls_log = logging.getLogger("seo_agent.llm")
+log = logging.getLogger("news_agent.run_history")  # never copied into a run's log (no recursion)
+calls_log = logging.getLogger("news_agent.llm")
 
 # The flow step running in this task (SeoFlow.step); crew worker threads fall back to RunHistory's per-run map.
 CURRENT_STEP: ContextVar[str | None] = ContextVar("seo_flow_step", default=None)

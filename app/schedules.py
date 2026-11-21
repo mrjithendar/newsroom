@@ -1,5 +1,7 @@
 """Flow schedules: moks-cms table seo_flow_schedules (migration 0037) and the one dispatcher that starts what is due.
 
+Forked from moks-seo-agent/app/schedules.py@bb9e553 on 2026-11-21.
+
 Until 2026-11-19 each scheduled flow had a Kubernetes CronJob of its own (15 in jithendar.com's kubernetes/). Now the
 schedules are rows an admin edits in the CrewAI console (/admin/crewai/schedules, D-98), and one CronJob calls
 POST /schedules/dispatch every minute (`python -m app.trigger dispatch`).
@@ -18,6 +20,11 @@ On each call, for every enabled schedule:
   and last_slot / last_fired_at are the only columns the agent writes (scripts/db-role.sql).
 
 Only flows in CRON_FLOWS can be scheduled: never publish_flow, the drafting flows or the per-story news flows.
+
+Two services dispatch from this one table: the seo-agent and the news agent (moks-seo-agent, mrjithendar/newsroom),
+each from its own CronJob. Each looks only at the rows whose flow it runs (`served`, = the keys of app/flows SPECS) and
+leaves the others untouched (not claimed, no status written, counted as `skipped`), so neither marks the other's
+schedules "cannot be scheduled". The slot claim still makes a time start once if both ever served the same flow.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from typing import Any, Protocol
 from .news.cron import Cron, CronError
 from .runs import RunError
 
-log = logging.getLogger("seo_agent.schedules")
+log = logging.getLogger("news_agent.schedules")
 
 SLOT_FORMAT = "%Y%m%dT%H%MZ"
 
@@ -114,12 +121,15 @@ def due_slot(row: dict[str, Any], now: datetime, catchup: timedelta) -> tuple[da
     return due, None
 
 
-async def dispatch(store: ScheduleStore, runner: Any, *, schedulable: frozenset[str], now: datetime | None = None, catchup: timedelta = timedelta(minutes=60)) -> dict[str, Any]:
-    """One tick: start every enabled schedule that is due. Never raises for one schedule; each outcome is reported."""
+async def dispatch(store: ScheduleStore, runner: Any, *, schedulable: frozenset[str], served: frozenset[str] | None = None, now: datetime | None = None, catchup: timedelta = timedelta(minutes=60)) -> dict[str, Any]:
+    """One tick: start every enabled schedule of this service that is due. Never raises for one schedule; each outcome
+    is reported. `served`: the flows this service runs; a row for any other flow is the other service's (skipped
+    before it is claimed). None = every row (tests)."""
     now = (now or datetime.now(UTC)).astimezone(UTC)
     rows = await store.enabled()
-    out: dict[str, Any] = {"at": now.isoformat(), "checked": len(rows), "fired": [], "errors": []}
-    for row in rows:
+    mine = [r for r in rows if served is None or str(r["flow_name"]) in served]
+    out: dict[str, Any] = {"at": now.isoformat(), "checked": len(mine), "skipped": len(rows) - len(mine), "fired": [], "errors": []}
+    for row in mine:
         name, flow = str(row["name"]), str(row["flow_name"])
         due, error = due_slot(row, now, catchup)
         if error:

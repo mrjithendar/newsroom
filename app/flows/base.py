@@ -1,7 +1,9 @@
 """Shared Flow plumbing: dependencies, the base class every flow extends, and step instrumentation.
 
+Forked from moks-seo-agent/app/flows/base.py@bb9e553 on 2026-11-21 (the SEO crews' factories removed).
+
 Every flow is a CrewAI `Flow[State]` with `@start` / `@listen` / `@router` methods. `SeoFlow` adds:
-- `deps` (settings, LLM, web app client, retriever, run store, the runner for child runs, crew factories);
+- `deps` (settings, LLM, web app client, site search, run store, the runner for child runs, the news desk's extras);
 - `step(name)`: duration histogram, OTel span and the run's `current_step` while the step runs (CrewAI's persistence
   then records the finished step and the state, app/runs.py), and the step's row in the run history (app/run_history.py:
   the admin run page's step list and the step its log lines belong to);
@@ -29,7 +31,7 @@ from ..runs import CURRENT_RUN_ID
 from ..tracing import span
 from ..webapp import WebApp, WebAppError
 
-log = logging.getLogger("seo_agent.flows")
+log = logging.getLogger("news_agent.flows")
 
 S = TypeVar("S", bound=BaseModel)
 
@@ -42,15 +44,9 @@ class Deps:
     retriever: Any
     store: Any = None  # RunStore
     runner: Any = None  # FlowRunner (child runs)
-    optimization_crew: Callable[[], Any] | None = None
-    editorial_crew: Callable[[], Any] | None = None
-    report_crew: Callable[[], Any] | None = None
-    promotion_crew: Callable[[], Any] | None = None
-    reindex: Callable[..., Awaitable[dict[str, int]]] | None = None  # (article_ids, full, force=False)
     history: Any = None  # RunHistory (app/run_history.py): steps, log lines and model calls for the admin run page
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
-    verify_delays: tuple[float, ...] = (40.0, 30.0, 60.0)
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)  # the news desk's store, embeddings, crew factory, clock
 
 
 def transient(e: BaseException) -> bool:

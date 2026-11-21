@@ -1,5 +1,7 @@
 """Crew configuration: the code's defaults, the admin's versioned overlay on them, and the test-run override.
 
+Forked from moks-seo-agent/app/crews/config.py@bb9e553 on 2026-11-21.
+
 What an admin can change from the CrewAI console (moks-cms /admin/crewai/crews, D-98), per crew:
 - each agent's role, goal, backstory, model, output-token limit, iteration limit and tools (only tools this crew's
   agents have in code: the allowlist in app/tools stays the boundary);
@@ -39,10 +41,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ..llm import PRICES
 from .common import AgentDef
 
-log = logging.getLogger("seo_agent.crews")
+log = logging.getLogger("news_agent.crews")
 
 FETCH_TIMEOUT_S = 5.0
-CREW_IDS = ("editorial", "optimization", "report", "promotion", "news")
+CREW_IDS = ("news",)  # the SEO crews are the seo-agent's (moks-seo-agent/app/crews)
 PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 MODEL_RE = r"^claude-[a-z0-9][a-z0-9.-]{2,60}$"
 
@@ -233,6 +235,7 @@ def catalogue(crew: CrewDef) -> dict[str, Any]:
     """GET /crews: what the console's crew editor shows and diffs against."""
     return {
         "crew": crew.crew,
+        "agent": "news",
         "label": crew.label,
         "description": crew.description,
         "prompt_version": crew.prompt_version,
@@ -247,9 +250,8 @@ def catalogue(crew: CrewDef) -> dict[str, Any]:
 def registry() -> dict[str, CrewDef]:
     """Every crew's definition, from the crew modules (imported here, not at module load: they import this one)."""
     from ..news import crew as news
-    from . import editorial, optimization, promotion, report
 
-    return {c.crew: c for c in (editorial.CREW, optimization.CREW, report.CREW, promotion.CREW, news.CREW)}
+    return {c.crew: c for c in (news.CREW,)}
 
 
 # --- the configuration a run uses ---------------------------------------------------------------------------------------

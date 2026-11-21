@@ -42,7 +42,7 @@ from .select import Candidate, select
 from .store import DuplicateArticle, NewsStore
 from .text import clean_text, content_hash, detect_language, entity_set, extract_entities, host_of, normalize_url, simhash, top_terms, url_hash, words
 
-log = logging.getLogger("seo_agent.news.desk")
+log = logging.getLogger("news_agent.news.desk")
 
 DEFAULT_PRIMARY_HOSTS = ("github.com", "kubernetes.io", "cncf.io", "aws.amazon.com", "docs.aws.amazon.com", "learn.microsoft.com", "azure.microsoft.com", "cloud.google.com", "developer.hashicorp.com", "hashicorp.com", "nvd.nist.gov", "cisa.gov", "www.cisa.gov", "istio.io", "prometheus.io", "grafana.com", "argo-cd.readthedocs.io", "docs.crewai.com", "modelcontextprotocol.io", "anthropic.com", "docs.anthropic.com", "openai.com")
 

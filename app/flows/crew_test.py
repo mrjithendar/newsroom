@@ -6,11 +6,14 @@ saving it. The configuration under test travels in this run's inputs, so the run
 produced its output; the run page offers to save them as a new version.
 
 What a test run does and does not do:
-- It reads the source run's state (seo_flow_runs.state_json: the brief, the article context, the report figures, the
-  promotion articles or idea signals) and, for the news crew, the story's items and the job's writing profile.
+- It reads the source run's inputs (seo_flow_runs.inputs: the news job and the story) and the story's items and the
+  job's writing profile, as news_draft_flow and the profile playground read them.
 - It runs the crew with the same limits, budget guard, run history and transcripts as any run.
-- It writes nothing anywhere else: no draft, report, promotion post, idea or news article; its output stays on this
-  run (outputs.result) for the console to show.
+- It writes nothing anywhere else: no draft and no news article; its output stays on this run (outputs.result) for the
+  console to show.
+
+The news agent has one crew, `news`. The SEO crews' test runs stay in the seo-agent (moks-seo-agent/app/flows/crew_test.py);
+moks-cms sends each test run to the agent that owns the crew.
 
 One test run per crew at a time (the lock target is the crew).
 """
@@ -24,7 +27,6 @@ from crewai.flow import persist, start
 from pydantic import Field, model_validator
 
 from ..crews import config as crew_config
-from ..crews.report import check_numbers, facts
 from ..llm import BudgetExceeded
 from ..news import desk as nd
 from ..runs import INSTANCE_ONLY
@@ -32,9 +34,9 @@ from ..state import UUID, RunState, _In
 from .base import SeoFlow
 from .news import NewsHelpers
 
-log = logging.getLogger("seo_agent.flows")
+log = logging.getLogger("news_agent.flows")
 
-CrewId = Literal["editorial", "optimization", "report", "promotion", "news"]
+CrewId = Literal["news"]
 OUTPUT_CHARS = 60_000  # a whole article body fits; anything longer is cut in the run's outputs
 
 
@@ -114,49 +116,8 @@ class CrewTestFlow(NewsHelpers, SeoFlow[CrewTestState]):
             crew_config.CREW_OVERRIDE.reset(token)
 
     async def _run(self, crew: str, src: dict[str, Any]) -> dict[str, Any]:
-        st: dict[str, Any] = src.get("state_json") or {}
-        inputs: dict[str, Any] = src.get("inputs") or {}
-        flow = str(src.get("flow_name"))
-        d = self.deps
-        untrusted = src.get("triggered_by") == "mcp"
-        if crew == "report":
-            numbers = st.get("numbers") or {}
-            if not numbers:
-                raise ReplayError("the source run has no report figures (it stopped before the report was built)")
-            fact_list = facts(numbers)
-            r = await d.report_crew().run(numbers, fact_list)
-            self.state.add_cost(r.cost_usd, r.tokens)
-            return {"status": r.status, "reason": r.reason, "tokens": r.tokens, "cost_usd": r.cost_usd, "narrative": r.narrative, "check": check_numbers(r.narrative, fact_list) if r.narrative else None}
-        if crew == "editorial":
-            brief = st.get("brief") or {}
-            if not brief:
-                raise ReplayError("the source run has no brief (it stopped before loading it)")
-            r = await d.editorial_crew().run(brief, feedback=st.get("feedback"), feedback_untrusted=untrusted, draft_id=None)
-            self.state.add_cost(r.cost_usd, r.tokens)
-            return {"status": r.status, "reason": r.draft.incomplete_reason, "tokens": r.tokens, "cost_usd": r.cost_usd, "draft": r.draft.model_dump(), "tool_calls": len(r.tool_calls), "fetched_sources": r.fetched_sources}
-        if crew == "optimization":
-            context, article_id = st.get("context") or {}, st.get("article_id") or inputs.get("article_id")
-            if not context or not article_id:
-                raise ReplayError("the source run has no article context (it stopped before loading it)")
-            r = await d.optimization_crew().run(context, article_id=str(article_id), related=st.get("related") or [], feedback=st.get("feedback"), feedback_untrusted=untrusted, draft_id=None, recommendation_ids=(st.get("plan") or {}).get("recommendation_ids"))
-            self.state.add_cost(r.cost_usd, r.tokens)
-            return {"status": r.status, "reason": r.reason, "tokens": r.tokens, "cost_usd": r.cost_usd, "result": r.result.model_dump() if r.result else None, "tool_calls": len(r.tool_calls)}
-        if crew == "promotion":
-            if flow == "content_ideas_flow":
-                signals = st.get("signals") or {}
-                if not signals:
-                    raise ReplayError("the source run has no idea signals (it stopped before collecting them)")
-                ri = await d.promotion_crew().ideas(signals)
-                self.state.add_cost(ri.cost_usd, ri.tokens)
-                return {"status": ri.status, "reason": ri.reason, "tokens": ri.tokens, "cost_usd": ri.cost_usd, "ideas": ri.ideas}
-            article = next((a for a in (st.get("articles") or []) if isinstance(a, dict) and a.get("channels")), None)
-            if article is None:
-                raise ReplayError("the source run has no article with channels to draft for")
-            rp = await d.promotion_crew().draft_posts(article)
-            self.state.add_cost(rp.cost_usd, rp.tokens)
-            return {"status": rp.status, "reason": rp.reason, "tokens": rp.tokens, "cost_usd": rp.cost_usd, "article": {k: article.get(k) for k in ("title", "url")}, "posts": rp.posts}
         if crew == "news":
-            return await self._news(inputs)
+            return await self._news(src.get("inputs") or {})
         raise ReplayError(f"unknown crew {crew}")
 
     async def _news(self, inputs: dict[str, Any]) -> dict[str, Any]:

@@ -1,5 +1,7 @@
 """Agent tools: read-only, allowlisted.
 
+Forked from moks-seo-agent/app/tools/__init__.py@bb9e553 on 2026-11-21.
+
 ALLOWED_TOOLS is the complete list an agent or crew member can ever hold. There is no shell, no arbitrary HTTP, no
 code execution and no database write among them: the one write in the system ("create/update draft") is done by flow
 steps through the web app's draft API, never by an agent. `build_tools` refuses any name outside the allowlist, and a test asserts the
@@ -15,9 +17,9 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-ALLOWED_TOOLS = frozenset({"read_article", "vector_search", "gsc_queries_for_topic", "gsc_queries_for_page", "style_guide", "fetch_allowlisted_docs"})
-# News Desk Crew (app/news/crew.py): read-only too. They are implemented by NewsToolContext (app/news/tools.py); a context
-# without them refuses the name, so an SEO crew can never be handed a news tool by mistake.
+# The News Desk Crew's tools (app/news/crew.py), all implemented by NewsToolContext (app/news/tools.py). The SEO crews'
+# tools (read_article, style_guide, fetch_allowlisted_docs, …) are the seo-agent's and do not exist here.
+ALLOWED_TOOLS = frozenset({"gsc_queries_for_topic"})
 NEWS_TOOLS = frozenset({"read_news_item", "fetch_allowlisted", "vector_search_site", "fact_sheet", "writing_profile", "image_profile"})
 ALL_TOOLS = ALLOWED_TOOLS | NEWS_TOOLS
 
@@ -159,83 +161,50 @@ def build_tools(names: list[str], ctx: ToolContext) -> list[ToolSpec]:
     unknown = [n for n in names if n not in ALL_TOOLS]
     if unknown:
         raise ToolError(f"tool(s) not on the allowlist: {', '.join(unknown)}")
-    news = [n for n in names if n in NEWS_TOOLS]
-    if news:
-        specs = getattr(ctx, "news_tool_specs", None)
-        if specs is None:
-            raise ToolError(f"news tool(s) need a news tool context: {', '.join(news)}")
+    specs = getattr(ctx, "news_tool_specs", None)
+    if specs is not None:
         reg = specs()
         return [reg[n] for n in names]
+    news = [n for n in names if n in NEWS_TOOLS]
+    if news:
+        raise ToolError(f"news tool(s) need a news tool context: {', '.join(news)}")
     registry: dict[str, ToolSpec] = {
-        "read_article": ToolSpec("read_article", "Read one of this site's articles by path (/blog/slug) or id. Input: the path or id.", ctx.read_article),
-        "vector_search": ToolSpec("vector_search", "Search this site's articles by meaning. Input: a short query. Returns titles, paths, sections and excerpts.", ctx.vector_search),
         "gsc_queries_for_topic": ToolSpec("gsc_queries_for_topic", "Search Console queries (28 days, aggregated) that contain the topic words. Input: a topic.", ctx.gsc_queries_for_topic),
-        "gsc_queries_for_page": ToolSpec("gsc_queries_for_page", "Search Console queries (28 days, aggregated: clicks, impressions, CTR, position) the article being optimised ranks for. Input: anything (the article is fixed).", ctx.gsc_queries_for_page),
-        "style_guide": ToolSpec("style_guide", "The site's writing style guide. Input: anything.", ctx.style_guide),
-        "fetch_allowlisted_docs": ToolSpec("fetch_allowlisted_docs", "Fetch an official documentation page (https, allowlisted domains only); returns its main text, at most 12,000 characters. Input: the URL. A long page ends with the anchors of the sections that did not fit: add one (url#anchor) to read from that section.", ctx.fetch_allowlisted_docs),
     }
     return [registry[n] for n in names]
 
 
+SEARCH_LIMIT = 6
+
+
 class ToolContext:
-    """Implements the tools on top of the web app callback API and the retriever. All results are data blocks.
+    """Implements the shared tools on top of the web app callback API and the site search. All results are data blocks.
 
-    `article_id` fixes gsc_queries_for_page to the article being optimised (an agent cannot ask about another page);
-    `style` is the style guide text the web app sent with the article context or brief."""
+    `retriever` is the site search (app/seo_agent.py RemoteRetriever: the seo-agent's index of this site's articles,
+    reached over POST /search); `docs_allowlist` the hosts a fetch may reach."""
 
-    def __init__(self, web: Any, retriever: Any, docs_allowlist: tuple[str, ...], on_source: Callable[[str, str], None] | None = None, *, article_id: str | None = None, style: str = ""):
-        self.article_id = article_id
-        self.style = style
+    def __init__(self, web: Any, retriever: Any, docs_allowlist: tuple[str, ...], on_source: Callable[[str, str], None] | None = None):
         self.web = web
         self.retriever = retriever
         self.docs_allowlist = docs_allowlist
         self.on_source = on_source
         self.calls: list[tuple[str, str]] = []
 
-    async def read_article(self, ref: str) -> str:
-        self.calls.append(("read_article", ref))
-        a = await self.web.read_article(ref.strip()[:300])
-        return data_block("article", {"title": a.get("title"), "path": a.get("path"), "body": str(a.get("body", ""))[:15_000]})
-
     async def vector_search(self, query: str) -> str:
         self.calls.append(("vector_search", query))
-        from ..services.content import ContentError, search
-
+        q = (query or "").strip()[:500]
+        if len(q) < 2:
+            return data_block("search_refused", {"reason": "query is too short"})
+        if self.retriever is None or not getattr(self.retriever, "available", True):
+            return data_block("search_unavailable", {"reason": "site search is unavailable (the seo-agent's index cannot be reached)"})
         try:
-            rows = await search(self.retriever, query, limit=6)  # the same function the public MCP search uses
-        except ContentError as e:
-            return data_block("search_refused", {"reason": str(e)})
-        return data_block("search_results", [{"title": r["title"], "path": r["path"], "section": r["section"], "anchor": r["anchor"], "excerpt": r["snippet"], "score": r["score"]} for r in rows])
+            hits = await self.retriever.search(q, k=SEARCH_LIMIT)
+        except Exception as e:  # the seo-agent is down or slow: the crew goes on without related articles
+            return data_block("search_unavailable", {"reason": f"site search failed: {type(e).__name__}"})
+        return data_block("search_results", [{"title": h.title, "path": h.path, "section": h.heading_path, "anchor": h.anchor, "excerpt": h.content[:400], "score": round(float(h.score), 3)} for h in hits[:SEARCH_LIMIT]])
 
     async def gsc_queries_for_topic(self, topic: str) -> str:
         self.calls.append(("gsc_queries_for_topic", topic))
         rows = await self.web.gsc_queries(topic=topic.strip()[:120], limit=25)
         keep = set(safe_queries([r["query"] for r in rows]))
         return data_block("search_console_queries_28d", [r for r in rows if r["query"] in keep])
-
-    async def gsc_queries_for_page(self, _input: str) -> str:
-        self.calls.append(("gsc_queries_for_page", self.article_id or ""))
-        if not self.article_id:
-            return data_block("search_console_queries_28d", [])
-        rows = await self.web.gsc_queries(article_id=self.article_id, limit=25)
-        keep = set(safe_queries([r["query"] for r in rows]))
-        return data_block("search_console_queries_28d", [r for r in rows if r["query"] in keep])
-
-    async def style_guide(self, _input: str) -> str:
-        self.calls.append(("style_guide", ""))
-        return data_block("style_guide", self.style[:12_000])
-
-    async def fetch_allowlisted_docs(self, url: str) -> str:
-        self.calls.append(("fetch_allowlisted_docs", url))
-        try:
-            clean = check_docs_url(url, self.docs_allowlist)
-        except ToolError as e:
-            return data_block("fetch_refused", {"url": url[:300], "reason": str(e)})
-        page, _, section = clean.partition("#")  # the fragment is never sent: it picks the section to read
-        r = await self.web.fetch_docs(page)
-        if r.get("error") or int(r.get("status", 0)) != 200:
-            return data_block("fetch_failed", {"url": clean, "status": r.get("status"), "reason": r.get("error")})
-        if self.on_source:
-            self.on_source(page, str(r.get("title", "")))
-        final = str(r.get("finalUrl") or page)
-        return data_block("documentation", {"url": f"{final}#{section}" if section else final, "title": r.get("title", ""), "text": html_to_text(str(r.get("body", "")), section=section, list_sections=True)})

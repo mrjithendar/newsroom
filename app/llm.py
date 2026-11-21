@@ -1,9 +1,11 @@
 """Claude access for every flow step and crew: Anthropic SDK client, budget guard, usage logging.
 
-- One LLM budget for everything (app/llm_budgets.py): usage rows go to the web app's `seo_llm_usage` table (same
-  columns, same prices), and the admin's daily and monthly limits count every row of it, whatever the purpose.
-  Ask-the-Blog counts in it too and also has its own daily cap (ASK_BLOG_DAILY_BUDGET_USD), a guard against readers
-  running up spend. There is no SEO_LLM_MONTHLY_BUDGET_USD any more: a budget is set in the admin, and none is preset.
+Forked from moks-seo-agent/app/llm.py@bb9e553 on 2026-11-21. The one difference: in the service the guard is
+app/seo_agent.py RemoteBudgetGuard, because the one LLM budget belongs to the seo-agent.
+
+- One LLM budget for everything: usage rows go to the web app's `seo_llm_usage` table (same columns, same prices,
+  purpose `news.*`), and the admin's daily and monthly limits (kept by the seo-agent) count every row of it. Before
+  each call its upper bound is held there (POST /llm-budget/reserve) and let go once the row is written.
 - Before every call an upper-bound estimate (characters / 3.5 in, full max_tokens out) is checked; a call that could
   cross the cap is never sent (BudgetExceeded → the flow run moves to paused_budget).
 - Stable system text (rules, style guide) is sent as cached system blocks (cache_control ephemeral).
@@ -289,10 +291,11 @@ class Reservation:
     scope: str | None  # "ask_daily" when the call also counts against Ask the Blog's own daily limit
     usd: float
     released: bool = False
+    hold_id: str | None = None  # the seo-agent's hold for this call (app/seo_agent.py RemoteBudgetGuard)
 
 
 PROVIDER = "anthropic"  # every call this service makes is a Claude call (seo_llm_usage.provider)
-HOLD_SECONDS = 900.0  # a hold taken over the API (POST /llm-budget/reserve) that is never settled lapses after this
+HOLD_SECONDS = 900.0  # a hold taken by holds() that is never settled lapses after this
 MAX_HOLDS = 500
 
 
@@ -426,6 +429,10 @@ class BudgetGuard:
             return False
         self.release(held[0])
         return True
+
+    async def exhausted(self) -> bool:
+        """Whether the one budget has nothing left for the day or the month (a news job does not start drafting)."""
+        return used_up(await self.status())
 
     async def status(self) -> dict[str, Any]:
         now = self.clock()

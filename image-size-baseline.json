@@ -1,8 +1,8 @@
 {
-  "image": "registry.jithendar.com/jithendar/seo-agent:latest (linux/arm64, built by ci.yml on the mk4 runner scale set)",
-  "uncompressed_bytes": 1981543239,
-  "compressed_bytes": 480937987,
-  "measured": "2026-11-21",
-  "commit": "fc00bf1",
-  "note": "From CI run 44891396979 (manual run on master after PR #16). Re-measured, not grown: the build moved from a GitHub-hosted amd64 runner to the mk4 arm64 runners (PR #15), whose dind daemon uses the classic overlay2 store, so 'uncompressed' (docker image inspect .Size) is now the unpacked filesystem. The hosted runner's containerd image store reported layer sizes as stored (already compressed), which is why the 2026-11-17 baseline had both numbers nearly equal (491626546 / 489574089 bytes). Compressed went from 489574089 to 480937987 bytes (-1.8 %): the image itself did not grow. If the runners or their Docker storage change again, re-measure the same way before reading a jump in 'uncompressed' as growth."
+  "image": "registry.jithendar.com/jithendar/news-agent:latest (linux/arm64, built by ci.yml on the mk4 runner scale set)",
+  "uncompressed_bytes": null,
+  "compressed_bytes": null,
+  "measured": null,
+  "commit": null,
+  "note": "No baseline yet: the first CI image build prints both sizes; copy them here (same PR, with the run id) to arm the +15 % gate. Expect a little less than the seo-agent's (no ReportLab; same CrewAI, ONNX model and ML wheels)."
 }

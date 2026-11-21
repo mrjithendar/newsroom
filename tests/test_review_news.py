@@ -434,23 +434,6 @@ async def test_rollback_and_drift_gauges(llm: Any) -> None:
     assert (out["classifier"] or 0) > 0.25 and gauge("news_model_score_psi", model="classifier") == out["classifier"]
 
 
-async def test_news_mcp_lists_models_read_only(llm: Any) -> None:
-    from mcp.shared.memory import create_connected_server_and_client_session
-
-    from app.mcp import create_edge_app
-    from tests.test_mcp import as_admin
-
-    c, _web, store = setup(llm)
-    m = flat_classifier()
-    await store.save_model("classifier", "clf-1", metrics={"macro_f1": 0.8, "per_topic": {"x": 1}}, n_samples=50, artifact=m.to_bytes(), active=True)
-    app = create_edge_app(c)
-    async with as_admin(["seo:read"]), create_connected_server_and_client_session(app.state.admin) as s:
-        tools = {t.name: t for t in (await s.list_tools()).tools}
-        assert tools["list_news_models"].annotations.readOnlyHint is True  # type: ignore[union-attr]
-        res = (await s.call_tool("list_news_models", {"kind": "classifier"})).structuredContent
-        assert res["models"][0]["version"] == "clf-1" and res["models"][0]["active"] and res["models"][0]["metrics"] == {"macro_f1": 0.8}
-
-
 # --- 10. budget reservation -----------------------------------------------------------------------------------------
 
 

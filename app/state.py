@@ -1,5 +1,7 @@
 """Typed (Pydantic) state for every CrewAI Flow, plus the strict kickoff input model of each flow.
 
+Forked from moks-seo-agent/app/state.py@bb9e553 on 2026-11-21.
+
 A Flow's state is what CrewAI persists after every step (app/runs.py → seo_flow_runs.state_json). Inputs are
 validated against the flow's *Input* model (extra fields refused, bounded sizes) before a run is created, so the API,
 the CronJob trigger and the admin MCP `kickoff_flow` tool all go through the same check.
@@ -11,7 +13,7 @@ refuses a draft that is not new or generation_failed (app/mcp/admin.py).
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,180 +42,3 @@ class RunState(BaseModel):
 
 class _In(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-
-class NoInput(_In):
-    pass
-
-
-class JobInput(_In):
-    slot: str | None = Field(default=None, max_length=40, pattern=r"^[0-9A-Za-z:_-]+$")
-
-
-class WeeklyInput(_In):
-    limit: int | None = Field(default=None, ge=1, le=25)
-
-
-class OptimizeInput(_In):
-    draft_id: str = Field(pattern=UUID)
-    article_id: str = Field(pattern=UUID)
-    recommendation_ids: list[str] = Field(default_factory=list, max_length=50)
-    extra: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
-    trigger: str = Field(default="manual", max_length=20)
-    feedback: str | None = Field(default=None, max_length=2000)
-
-
-class LinkingInput(_In):
-    article_ids: list[str] = Field(default_factory=list, max_length=50)
-
-
-class NewArticleInput(_In):
-    draft_id: str = Field(pattern=UUID)
-    calendar_id: str = Field(pattern=UUID)
-    article_id: str | None = Field(default=None, pattern=UUID)
-    feedback: str | None = Field(default=None, max_length=2000)
-
-
-class PublishInput(_In):
-    draft_id: str = Field(pattern=UUID)
-    approval_id: str = Field(min_length=1, max_length=80)
-    accepted_change_ids: list[str] = Field(max_length=200)
-    edits: dict[str, str] = Field(default_factory=dict)
-    actor: str | None = Field(default=None, max_length=200)
-
-
-class ReindexInput(_In):
-    article_ids: list[str] | None = Field(default=None, max_length=200)
-    full: bool = False
-    force: bool = False  # skip the index safety guard (IndexSafetyError) after checking the article list
-
-
-class MlInput(_In):
-    # empty = every model; else a subset of decay, query_clusters, intent, priority, related, rag_eval
-    models: list[Literal["decay", "query_clusters", "intent", "priority", "related", "rag_eval"]] = Field(default_factory=list, max_length=6)
-    suggest_labels: bool = False  # ask Claude to suggest groupings for the 200-query labelling sample (once)
-    slot: str | None = Field(default=None, max_length=40, pattern=r"^[0-9A-Za-z:_-]+$")
-
-
-class ReportInput(_In):
-    period: Literal["weekly", "monthly"] = "weekly"
-
-
-class PromotionInput(_In):
-    # one published article (re-score, redraft unedited drafts); omitted = the newest articles without opportunities
-    article_id: str | None = Field(default=None, pattern=UUID)
-    limit: int | None = Field(default=None, ge=1, le=10)
-
-
-# --- States -------------------------------------------------------------------------------------------------------
-
-
-class JobState(RunState):
-    job_type: str = ""
-    slot: str | None = None
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class WeeklyState(RunState):
-    limit: int | None = None
-    prepared: dict[str, Any] = Field(default_factory=dict)
-    children: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class OptimizeState(RunState):
-    draft_id: str = ""
-    article_id: str = ""
-    recommendation_ids: list[str] = Field(default_factory=list)
-    extra: list[dict[str, Any]] = Field(default_factory=list)
-    trigger: str = "manual"
-    feedback: str | None = None  # the reviewer's (regenerate) feedback; kept for every attempt of this run
-    validator_feedback: str | None = None  # the validator's errors on the previous attempt (the automatic retry)
-    context: dict[str, Any] = Field(default_factory=dict)
-    related: list[dict[str, Any]] = Field(default_factory=list)
-    plan: dict[str, Any] = Field(default_factory=dict)
-    change_set: dict[str, Any] | None = None
-    crew: dict[str, Any] = Field(default_factory=dict)
-    changes: list[dict[str, Any]] = Field(default_factory=list)
-    validation_report: dict[str, Any] = Field(default_factory=dict)
-    attempts: int = 0
-
-
-class LinkingState(RunState):
-    article_ids: list[str] = Field(default_factory=list)
-    candidates: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
-    results: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class NewArticleState(RunState):
-    draft_id: str = ""
-    calendar_id: str = ""
-    article_id: str | None = None
-    feedback: str | None = None  # the reviewer's (regenerate) feedback; kept for every attempt of this run
-    validator_feedback: str | None = None  # the validator's errors on the previous attempt (the automatic retry)
-    brief: dict[str, Any] = Field(default_factory=dict)
-    document: dict[str, Any] | None = None
-    crew: dict[str, Any] = Field(default_factory=dict)
-    changes: list[dict[str, Any]] = Field(default_factory=list)
-    validation_report: dict[str, Any] = Field(default_factory=dict)
-    attempts: int = 0
-
-
-class PublishState(RunState):
-    draft_id: str = ""
-    article_id: str | None = None
-    approval_id: str = ""
-    accepted_change_ids: list[str] = Field(default_factory=list)
-    edits: dict[str, str] = Field(default_factory=dict)
-    actor: str | None = None
-    publish_result: dict[str, Any] = Field(default_factory=dict)
-    verification: dict[str, Any] = Field(default_factory=dict)
-    submission_results: dict[str, Any] = Field(default_factory=dict)
-    reindex: dict[str, Any] = Field(default_factory=dict)
-    measurement: dict[str, Any] = Field(default_factory=dict)
-
-
-class ReindexState(RunState):
-    article_ids: list[str] | None = None
-    full: bool = False
-    force: bool = False
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class AskGapsState(RunState):
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class ReportState(RunState):
-    period: str = "weekly"
-    report_id: str | None = None
-    numbers: dict[str, Any] = Field(default_factory=dict)
-    narrative: str = ""
-    check: dict[str, Any] = Field(default_factory=dict)
-    crew: dict[str, Any] = Field(default_factory=dict)
-    pdf: dict[str, Any] = Field(default_factory=dict)
-    notified: dict[str, Any] = Field(default_factory=dict)
-
-
-class MlState(RunState):
-    models: list[str] = Field(default_factory=list)
-    suggest_labels: bool = False
-    slot: str | None = None
-    results: dict[str, Any] = Field(default_factory=dict)
-
-
-class PromotionState(RunState):
-    article_id: str | None = None
-    limit: int | None = None
-    reddit: dict[str, Any] = Field(default_factory=dict)
-    articles: list[dict[str, Any]] = Field(default_factory=list)
-    drafts: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
-    results: list[dict[str, Any]] = Field(default_factory=list)
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class ContentIdeasState(RunState):
-    reddit: dict[str, Any] = Field(default_factory=dict)
-    signals: dict[str, Any] = Field(default_factory=dict)
-    ideas: list[dict[str, Any]] = Field(default_factory=list)
-    crew: dict[str, Any] = Field(default_factory=dict)
-    result: dict[str, Any] = Field(default_factory=dict)

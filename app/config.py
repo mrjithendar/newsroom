@@ -1,7 +1,12 @@
-"""seo-agent settings, from environment variables only (docs/seo/AGENTS.md lists them all).
+"""news-agent settings, from environment variables only (README.md lists them all).
 
-Secrets (ANTHROPIC_API_KEY, SEO_AGENT_TOKEN, SEO_AGENT_CALLBACK_TOKEN, DATABASE_URL, SEO_AGENT_DATABASE_URL) come from
-Kubernetes Secrets and are never logged, returned by an endpoint or put into a prompt.
+Forked from moks-seo-agent/app/config.py@bb9e553 on 2026-11-21 and cut down to what the news desk reads. The news
+desk's own settings (sources, caps, models, quality thresholds, the on/off switch) are the Newsroom settings row in
+the web app's database (app/news/config.py), edited in Admin → Newsroom → Settings, not environment variables.
+
+Secrets (ANTHROPIC_API_KEY, NEWS_AGENT_TOKEN, NEWS_AGENT_CALLBACK_TOKEN, SEO_AGENT_NEWS_TOKEN, DATABASE_URL,
+NEWS_AGENT_DATABASE_URL, OPENAI_API_KEY) come from Kubernetes Secrets and are never logged, returned by an endpoint or
+put into a prompt.
 """
 
 from __future__ import annotations
@@ -13,8 +18,7 @@ from dataclasses import dataclass, field
 # Third-party telemetry off before crewai is imported anywhere (crewai_core 1.15.30 reads these at import/first use).
 # OTEL_SDK_DISABLED is deliberately NOT set: it would also switch off this service's own OpenTelemetry tracing.
 # CREWAI_STORAGE_DIR points CrewAI's local storage at an emptyDir: nothing may write SQLite there (the flows use the
-# Postgres persistence, app/runs.py, and a test asserts no .db file appears), but if a code path ever tried, it must
-# not land in the read-only image.
+# Postgres persistence, app/runs.py), but if a code path ever tried, it must not land in the read-only image.
 for _k, _v in {
     "CREWAI_DISABLE_TELEMETRY": "true",
     "CREWAI_DISABLE_TRACKING": "true",
@@ -24,7 +28,8 @@ for _k, _v in {
 }.items():
     os.environ.setdefault(_k, _v)
 
-# Official documentation only (the host or a subdomain). Keep equal to moks-cms/src/lib/seo-agent/config.ts.
+# Official documentation hosts a news researcher may also fetch as primary sources (the host or a subdomain), on top
+# of the story's own source hosts and the Newsroom's primary-source hosts. Same list as moks-seo-agent/app/config.py.
 DEFAULT_DOCS_ALLOWLIST = (
     "kubernetes.io",
     "docs.aws.amazon.com",
@@ -74,15 +79,6 @@ DEFAULT_DOCS_ALLOWLIST = (
 )
 
 
-def _bool(name: str, default: bool, env: Mapping[str, str] | None = None) -> bool:
-    v = (os.environ if env is None else env).get(name, "").strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
 def _float(name: str, default: float, env: Mapping[str, str] | None = None) -> float:
     try:
         v = float((os.environ if env is None else env).get(name, ""))
@@ -102,83 +98,47 @@ def _int(name: str, default: int, env: Mapping[str, str] | None = None) -> int:
 @dataclass(frozen=True)
 class Settings:
     database_url: str = ""
-    # Next.js admin API → seo-agent (bearer). Required: the service refuses to start without it in production.
+    # Web app admin API → news-agent (bearer). Required: the service refuses to start without it in production.
     agent_token: str = ""
-    # seo-agent → Next.js internal callback API (bearer), a different secret so one leaked direction is not both.
+    # news-agent → web app internal callback API (bearer). Its own secret: the web app accepts it on the news routes only.
     callback_token: str = ""
     callback_url: str = "http://jithendar-com-internal.jithendar:9465"
+    # news-agent → seo-agent: site search and the one LLM budget (app/seo_agent.py). Empty = neither.
+    seo_agent_url: str = ""
+    seo_agent_token: str = ""
     anthropic_api_key: str = ""
+    # The crews' default model when neither the job, the crew configuration nor NEWS_CREW_MODELS names one.
     draft_model: str = "claude-sonnet-5-5"
     classify_model: str = "claude-haiku-5-5"
-    ask_daily_budget_usd: float = 1.0
-    ask_enabled: bool = False
-    # D-93: copy the article index into LanceDB on R2 after each reindex (/admin/lancedb → article_chunks).
-    lancedb_article_index: bool = True
-    crew_max_tokens_per_run: int = 150_000  # ≈ a normal 4-agent run is ~80k (docs/seo/COSTS.md)
+    crew_max_tokens_per_run: int = 150_000
     crew_timeout_s: int = 600
     crew_max_iter: int = 4
     crew_max_rpm: int = 20
-    # Per-agent model overrides, "<crew>.<agent>" → model, e.g. {"optimization.analyst": "claude-haiku-5-5"}.
+    # Per-agent model overrides, "news.<agent>" → model, e.g. {"news.analyst": "claude-haiku-5-5"}.
     crew_models: dict[str, str] = field(default_factory=dict)
-    # Per-agent max_iter overrides, "<crew>.<agent>" → turns (1–20), e.g. {"editorial.researcher": 10}; others use
-    # crew_max_iter.
+    # Per-agent max_iter overrides, "news.<agent>" → turns (1–20); others use crew_max_iter.
     crew_max_iters: dict[str, int] = field(default_factory=dict)
-    # Per-request timeout of the Anthropic client. A 16k-token article body on a larger model can take minutes.
+    # Per-request timeout of the Anthropic client.
     llm_timeout_s: float = 120.0
-    fanout_concurrency: int = 2
-    weekly_max_articles: int = 10
     embeddings_provider: str = "onnx"
     embeddings_model_dir: str = "/models/bge-small-en-v1.5"
     ollama_url: str = ""
     ollama_model: str = "nomic-embed-text"
     ollama_embed_dim: int = 0  # 0 = the model's known size (embeddings.OLLAMA_MODELS)
-    embeddings_timeout_s: float = 300.0  # per request to Ollama; mk4's CPU bge-m3 takes ~12 s for a batch of 8
+    embeddings_timeout_s: float = 300.0
     embeddings_api_url: str = ""
     embeddings_api_key: str = ""
     docs_allowlist: tuple[str, ...] = field(default=DEFAULT_DOCS_ALLOWLIST)
-    ask_cache_ttl_s: int = 900
-    ask_top_k: int = 6
-    # Cosine pre-filter for retrieved chunks, calibrated per embeddings model on the eval set = the highest floor that
-    # loses no expected answer (RAG.md "Score calibration"). load_settings takes the model's value from
-    # app/calibration.py unless ASK_BLOG_MIN_SCORE is set; 0.66 is bge-small's.
-    ask_min_score: float = 0.66
-    ask_retention_days: int = 30
     production: bool = False
     otel_endpoint: str = ""
-    service_name: str = "seo-agent"
-    # v4: MCP (docs/seo/MCP.md). Both servers are off until switched on; the admin one only after OAuth is verified.
-    site_url: str = "https://jithendar.com"
-    public_mcp_enabled: bool = False
-    admin_mcp_enabled: bool = False
-    edge_port: int = 8090  # MCP listener (Kong → here only); the internal API stays on PORT (8080)
-    mcp_allowed_hosts: tuple[str, ...] = ("jithendar.com", "www.jithendar.com")
-    public_mcp_rpm_per_ip: int = 30
-    public_mcp_daily_calls: int = 5000
-    admin_mcp_rpm_per_token: int = 120
-    admin_kickoffs_per_hour: int = 10
-    # Tools an admin switched off (app/admin_settings group "mcp"). A tool named here is refused at once and is left
-    # out of the tool list after a restart. Unknown names do nothing. Nothing here can add a tool.
-    mcp_admin_tools_off: tuple[str, ...] = ()
-    mcp_public_tools_off: tuple[str, ...] = ()
-    # Flows that may NOT be started over MCP although the code's allowlist has them. It only narrows the allowlist.
-    mcp_kickoffs_off: tuple[str, ...] = ()
+    service_name: str = "news-agent"
     flow_timeout_s: int = 1800  # wall clock per flow run (crews have their own, shorter limit)
     # Schedules (app/schedules.py): how late a missed fire time still runs, e.g. after the agent was down.
     schedule_catchup_min: int = 60
 
-    @property
-    def admin_mcp_resource(self) -> str:
-        """RFC 8707 resource indicator / token audience of the admin MCP server."""
-        return f"{self.site_url.rstrip('/')}/mcp/admin"
-
-
-def _names(raw: str) -> tuple[str, ...]:
-    """A comma-separated list of tool or flow names, lower-cased, without blanks or repeats."""
-    return tuple(dict.fromkeys(n.strip().lower() for n in raw.split(",") if n.strip()))
-
 
 def _models(raw: str) -> dict[str, str]:
-    """SEO_CREW_MODELS: JSON object of "<crew>.<agent>" → Claude model id; anything malformed is ignored."""
+    """NEWS_CREW_MODELS: JSON object of "<crew>.<agent>" → Claude model id; anything malformed is ignored."""
     import json
     import re
 
@@ -192,7 +152,7 @@ def _models(raw: str) -> dict[str, str]:
 
 
 def _max_iters(raw: str) -> dict[str, int]:
-    """SEO_CREW_MAX_ITERS: JSON object of "<crew>.<agent>" → max_iter (1–20); anything malformed is ignored."""
+    """NEWS_CREW_MAX_ITERS: JSON object of "<crew>.<agent>" → max_iter (1–20); anything malformed is ignored."""
     import json
     import re
 
@@ -215,66 +175,38 @@ def embeddings_model_name(provider: str, model_dir: str, ollama_model: str) -> s
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
-    """`env` defaults to the process environment. The admin settings store (app/admin_settings) passes the
-    environment with the admin's saved values laid over it, so a saved value wins over the deployment's and every
-    clamp below applies to both."""
-    from .calibration import calibration_for
-
     env = os.environ if env is None else env
-    docs = tuple(h.strip().lower() for h in env.get("SEO_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
-    provider = env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx"
-    model_dir = env.get("EMBEDDINGS_MODEL_DIR", Settings.embeddings_model_dir)
-    ollama_model = env.get("OLLAMA_EMBED_MODEL", Settings.ollama_model)
-    floor = calibration_for(embeddings_model_name(provider, model_dir, ollama_model)).ask_min_score
+    docs = tuple(h.strip().lower() for h in env.get("NEWS_AGENT_DOCS_ALLOWLIST", "").split(",") if h.strip())
     return Settings(
         # Its own, narrower database role when one is configured (scripts/db-role.sql); otherwise the web app's.
-        database_url=env.get("SEO_AGENT_DATABASE_URL", "").strip() or env.get("DATABASE_URL", ""),
-        agent_token=env.get("SEO_AGENT_TOKEN", ""),
-        callback_token=env.get("SEO_AGENT_CALLBACK_TOKEN", ""),
-        callback_url=env.get("SEO_AGENT_CALLBACK_URL", Settings.callback_url).rstrip("/"),
+        database_url=env.get("NEWS_AGENT_DATABASE_URL", "").strip() or env.get("DATABASE_URL", ""),
+        agent_token=env.get("NEWS_AGENT_TOKEN", ""),
+        callback_token=env.get("NEWS_AGENT_CALLBACK_TOKEN", ""),
+        callback_url=env.get("NEWS_AGENT_CALLBACK_URL", Settings.callback_url).rstrip("/"),
+        seo_agent_url=env.get("SEO_AGENT_URL", "").strip().rstrip("/"),
+        seo_agent_token=env.get("SEO_AGENT_NEWS_TOKEN", "").strip(),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", ""),
-        draft_model=env.get("SEO_DRAFT_MODEL", "").strip() or Settings.draft_model,
-        classify_model=env.get("SEO_CLASSIFY_MODEL", "").strip() or Settings.classify_model,
-        ask_daily_budget_usd=_float("ASK_BLOG_DAILY_BUDGET_USD", Settings.ask_daily_budget_usd, env),
-        ask_enabled=_bool("ASK_BLOG_ENABLED", False, env),
-        lancedb_article_index=_bool("LANCEDB_ARTICLE_INDEX", True, env),
+        draft_model=env.get("NEWS_DRAFT_MODEL", "").strip() or Settings.draft_model,
+        classify_model=env.get("NEWS_CLASSIFY_MODEL", "").strip() or Settings.classify_model,
         crew_max_tokens_per_run=_int("CREW_MAX_TOKENS_PER_RUN", Settings.crew_max_tokens_per_run, env),
         crew_timeout_s=_int("CREW_TIMEOUT_SECONDS", Settings.crew_timeout_s, env),
         crew_max_iter=_int("CREW_MAX_ITER", Settings.crew_max_iter, env),
         crew_max_rpm=max(1, _int("CREW_MAX_RPM", Settings.crew_max_rpm, env)),
-        crew_models=_models(env.get("SEO_CREW_MODELS", "")),
-        crew_max_iters=_max_iters(env.get("SEO_CREW_MAX_ITERS", "")),
-        llm_timeout_s=max(30.0, min(900.0, _float("SEO_LLM_TIMEOUT_SECONDS", Settings.llm_timeout_s, env))),
-        fanout_concurrency=max(1, _int("SEO_AGENT_FANOUT_CONCURRENCY", Settings.fanout_concurrency, env)),
-        weekly_max_articles=_int("SEO_AGENT_WEEKLY_MAX_ARTICLES", Settings.weekly_max_articles, env),
-        embeddings_provider=provider,
-        embeddings_model_dir=model_dir,
+        crew_models=_models(env.get("NEWS_CREW_MODELS", "")),
+        crew_max_iters=_max_iters(env.get("NEWS_CREW_MAX_ITERS", "")),
+        llm_timeout_s=max(30.0, min(900.0, _float("NEWS_LLM_TIMEOUT_SECONDS", Settings.llm_timeout_s, env))),
+        embeddings_provider=env.get("EMBEDDINGS_PROVIDER", "onnx").strip().lower() or "onnx",
+        embeddings_model_dir=env.get("EMBEDDINGS_MODEL_DIR", Settings.embeddings_model_dir),
         ollama_url=env.get("OLLAMA_URL", "").rstrip("/"),
-        ollama_model=ollama_model,
+        ollama_model=env.get("OLLAMA_EMBED_MODEL", Settings.ollama_model),
         ollama_embed_dim=max(0, _int("OLLAMA_EMBED_DIM", 0, env)),
         embeddings_timeout_s=max(10.0, min(1800.0, _float("EMBEDDINGS_TIMEOUT_SECONDS", Settings.embeddings_timeout_s, env))),
         embeddings_api_url=env.get("EMBEDDINGS_API_URL", ""),
         embeddings_api_key=env.get("EMBEDDINGS_API_KEY", ""),
         docs_allowlist=docs or DEFAULT_DOCS_ALLOWLIST,
-        ask_cache_ttl_s=_int("ASK_BLOG_CACHE_TTL_SECONDS", Settings.ask_cache_ttl_s, env),
-        ask_top_k=max(1, min(12, _int("ASK_BLOG_TOP_K", Settings.ask_top_k, env))),
-        ask_min_score=max(0.0, min(0.95, _float("ASK_BLOG_MIN_SCORE", floor, env))),
-        ask_retention_days=_int("ASK_BLOG_RETENTION_DAYS", Settings.ask_retention_days, env),
         production=env.get("APP_ENV", "") == "production",
         otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
-        service_name=env.get("OTEL_SERVICE_NAME", "seo-agent"),
-        site_url=(env.get("SITE_URL", "").strip() or Settings.site_url).rstrip("/"),
-        public_mcp_enabled=_bool("PUBLIC_MCP_ENABLED", False, env),
-        admin_mcp_enabled=_bool("ADMIN_MCP_ENABLED", False, env),
-        edge_port=_int("SEO_AGENT_EDGE_PORT", Settings.edge_port, env),
-        mcp_allowed_hosts=tuple(h.strip().lower() for h in env.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()) or Settings.mcp_allowed_hosts,
-        public_mcp_rpm_per_ip=max(1, _int("PUBLIC_MCP_RPM_PER_IP", Settings.public_mcp_rpm_per_ip, env)),
-        public_mcp_daily_calls=_int("PUBLIC_MCP_DAILY_CALLS", Settings.public_mcp_daily_calls, env),
-        admin_mcp_rpm_per_token=max(1, _int("ADMIN_MCP_RPM_PER_TOKEN", Settings.admin_mcp_rpm_per_token, env)),
-        admin_kickoffs_per_hour=max(1, _int("ADMIN_MCP_KICKOFFS_PER_HOUR", Settings.admin_kickoffs_per_hour, env)),
-        mcp_admin_tools_off=_names(env.get("MCP_ADMIN_TOOLS_OFF", "")),
-        mcp_public_tools_off=_names(env.get("MCP_PUBLIC_TOOLS_OFF", "")),
-        mcp_kickoffs_off=_names(env.get("MCP_KICKOFFS_OFF", "")),
-        flow_timeout_s=max(60, _int("SEO_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s, env)),
+        service_name=env.get("OTEL_SERVICE_NAME", "news-agent"),
+        flow_timeout_s=max(60, _int("NEWS_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s, env)),
         schedule_catchup_min=max(2, min(1440, _int("SCHEDULE_CATCHUP_MINUTES", Settings.schedule_catchup_min, env))),
     )
