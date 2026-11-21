@@ -1,8 +1,8 @@
 {
-  "image": "seo-agent:ci (linux/amd64, the pull request build in ci-seo-agent.yml)",
-  "uncompressed_bytes": 491626546,
-  "compressed_bytes": 489574089,
-  "measured": "2026-11-17",
-  "commit": "0feb953",
-  "note": "From CI run 44052015685 (PR #121, LanceDB installed again, D-91): +105 MiB (+28.9 %) over the 2026-11-10 baseline of 381485288 / 379873084 bytes, raised on purpose. lancedb's wheel is 71.7 MiB and pyarrow's 51.4 MiB as downloaded. The two numbers are nearly equal: the runner's Docker (containerd image store) reports layer sizes as stored, i.e. already compressed, so 'uncompressed' here is the image-store size, not the unpacked filesystem. The +15 % gate compares like with like either way."
+  "image": "registry.jithendar.com/jithendar/seo-agent:latest (linux/arm64, built by ci.yml on the mk4 runner scale set)",
+  "uncompressed_bytes": 1981543239,
+  "compressed_bytes": 480937987,
+  "measured": "2026-11-21",
+  "commit": "fc00bf1",
+  "note": "From CI run 44891396979 (manual run on master after PR #16). Re-measured, not grown: the build moved from a GitHub-hosted amd64 runner to the mk4 arm64 runners (PR #15), whose dind daemon uses the classic overlay2 store, so 'uncompressed' (docker image inspect .Size) is now the unpacked filesystem. The hosted runner's containerd image store reported layer sizes as stored (already compressed), which is why the 2026-11-17 baseline had both numbers nearly equal (491626546 / 489574089 bytes). Compressed went from 489574089 to 480937987 bytes (-1.8 %): the image itself did not grow. If the runners or their Docker storage change again, re-measure the same way before reading a jump in 'uncompressed' as growth."
 }
