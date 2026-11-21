@@ -94,11 +94,14 @@ They live in `app/admin_settings/`:
 
 ## CI and release
 
-- `.github/workflows/ci.yml` runs on pull requests. It runs lint, types, tests (without the moks-cms contract tests)
-  and pip-audit, then builds the image without pushing it and smoke-tests it.
-- When a pull request is merged, it builds the arm64 image once and smoke-tests it while the tests run again on the
-  merge commit, then pushes `registry.jithendar.com/jithendar/seo-agent:latest` once they pass. That's all: it tells no
-  site and deploys nothing, so each site pulls and restarts the agent itself.
+- `.github/workflows/ci.yml` is one job on one mk4 runner. On every run it runs lint, types, tests (without the
+  moks-cms contract tests), the RAG eval smoke and pip-audit.
+- A pull request also builds and smoke-tests the image only when it changes an input of the image beyond the Python
+  code (`Dockerfile`, `.dockerignore`, `pyproject.toml`, `uv.lock`, the image scripts or size baseline, `ci.yml`). A
+  manual run always does.
+- When a pull request is merged, the same job runs the checks on the merge commit, then builds the arm64 image,
+  smoke-tests it and pushes `registry.jithendar.com/jithendar/seo-agent:latest`. Merges release one at a time. That's
+  all: it tells no site and deploys nothing, so each site pulls and restarts the agent itself.
 - `.github/workflows/rag-eval.yml` is the manual retrieval evaluation with the production embedding model.
 
 Repository settings (private repository on GitHub Free, so these are set at repository level):

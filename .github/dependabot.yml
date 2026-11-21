@@ -1,4 +1,5 @@
-# Dependabot version updates. Pull requests run `check` in ci.yml; merging one pushes a new seo-agent:latest.
+# Dependabot version updates. Pull requests run ci.yml (with the image build: uv.lock changes); merging one pushes a new
+# seo-agent:latest.
 #
 # Minor and patch updates are grouped to keep the PR count down; majors arrive one PR each.
 # Security updates are not grouped and are not held back by the cooldown.
