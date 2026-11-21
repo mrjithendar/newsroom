@@ -156,6 +156,12 @@ class Settings:
     public_mcp_daily_calls: int = 5000
     admin_mcp_rpm_per_token: int = 120
     admin_kickoffs_per_hour: int = 10
+    # Tools an admin switched off (app/admin_settings group "mcp"). A tool named here is refused at once and is left
+    # out of the tool list after a restart. Unknown names do nothing. Nothing here can add a tool.
+    mcp_admin_tools_off: tuple[str, ...] = ()
+    mcp_public_tools_off: tuple[str, ...] = ()
+    # Flows that may NOT be started over MCP although the code's allowlist has them. It only narrows the allowlist.
+    mcp_kickoffs_off: tuple[str, ...] = ()
     flow_timeout_s: int = 1800  # wall clock per flow run (crews have their own, shorter limit)
     # Schedules (app/schedules.py): how late a missed fire time still runs, e.g. after the agent was down.
     schedule_catchup_min: int = 60
@@ -164,6 +170,11 @@ class Settings:
     def admin_mcp_resource(self) -> str:
         """RFC 8707 resource indicator / token audience of the admin MCP server."""
         return f"{self.site_url.rstrip('/')}/mcp/admin"
+
+
+def _names(raw: str) -> tuple[str, ...]:
+    """A comma-separated list of tool or flow names, lower-cased, without blanks or repeats."""
+    return tuple(dict.fromkeys(n.strip().lower() for n in raw.split(",") if n.strip()))
 
 
 def _models(raw: str) -> dict[str, str]:
@@ -261,6 +272,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         public_mcp_daily_calls=_int("PUBLIC_MCP_DAILY_CALLS", Settings.public_mcp_daily_calls, env),
         admin_mcp_rpm_per_token=max(1, _int("ADMIN_MCP_RPM_PER_TOKEN", Settings.admin_mcp_rpm_per_token, env)),
         admin_kickoffs_per_hour=max(1, _int("ADMIN_MCP_KICKOFFS_PER_HOUR", Settings.admin_kickoffs_per_hour, env)),
+        mcp_admin_tools_off=_names(env.get("MCP_ADMIN_TOOLS_OFF", "")),
+        mcp_public_tools_off=_names(env.get("MCP_PUBLIC_TOOLS_OFF", "")),
+        mcp_kickoffs_off=_names(env.get("MCP_KICKOFFS_OFF", "")),
         flow_timeout_s=max(60, _int("SEO_FLOW_TIMEOUT_SECONDS", Settings.flow_timeout_s, env)),
         schedule_catchup_min=max(2, min(1440, _int("SCHEDULE_CATCHUP_MINUTES", Settings.schedule_catchup_min, env))),
     )

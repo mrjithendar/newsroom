@@ -133,7 +133,7 @@ They live in `app/admin_settings/`:
 Groups so far: **Agent limits**; **Embeddings** (the backend's address, key and time limit; the provider and model
 stay in the deployment until a guarded re-embed exists); **Retrieval** (passages per answer, lowest similarity,
 how long questions are kept, the LanceDB copy); **MCP servers** (the two switches, live; their rate limits and
-allowed hosts, on restart). Ask the Blog's own switch, audience, daily limit and cache time stay in Ask the Blog.
+allowed hosts, on restart). It also holds three lists that only take things away: public tools switched off, admin tools switched off (refused at once, out of the tool list after a restart) and flows that may not be started over MCP (narrows the code's allowlist, never widens it). Ask the Blog's own switch, audience, daily limit and cache time stay in Ask the Blog.
 
 ## CI and release
 
