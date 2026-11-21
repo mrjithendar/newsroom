@@ -70,6 +70,9 @@ provider's own spend limit stops spending.
   tokens) are entered, unless it is a Claude model with a built-in price (`app/llm.py` `PRICES`) or it is marked free.
 - **API.** `GET /llm-providers`, `PUT /llm-providers` (one provider and, when `models` is sent, all of its models;
   validated, all or nothing), `GET /llm-models` (models that are on, for pickers).
+- **Fetch models.** `POST /llm-providers/{id}/discover` asks the provider for its model list (Anthropic and the
+  OpenAI-compatible kinds) and marks which ones are already listed. Nothing is saved or switched on, and it costs
+  nothing. Gemini, Azure OpenAI and Bedrock models are added by hand for now.
 - **Not yet.** Nothing calls a provider from these tables: every job still calls Anthropic as before. The adapters,
   "Fetch models", "Test", and the model for each job come in later changes; until then Anthropic cannot be switched
   off here.
