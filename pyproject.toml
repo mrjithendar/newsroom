@@ -7,10 +7,10 @@ requires-python = ">=3.13,<3.14"
 # implementation time (2026-11-10). `tool.uv.exclude-newer = "2 weeks"` applies the same rule to every transitive
 # dependency on every re-lock (Dependabot included), so no date needs bumping.
 dependencies = [
-  "crewai==1.15.35",
+  "crewai==1.15.37",
   # Official SDKs, pinned directly (D-54): Claude through the Anthropic SDK behind CrewAI's BaseLLM; MCP servers through
   # the official MCP SDK. crewai requires mcp<2, so 1.30.0 (the newest 1.x) rather than 2.3.0.
-  "anthropic==2.4.0",
+  "anthropic==2.6.0",
   "mcp==1.30.0",
   # Report PDFs (D-61): pure Python, no system libraries, CPU-only image stays slim.
   "reportlab==5.1.0",
@@ -36,7 +36,7 @@ dependencies = [
 dev = [
   "pytest==9.2.0",
   "pytest-asyncio==1.4.1.post1",
-  "ruff==0.17.3",
+  "ruff==0.17.4",
   "mypy==2.4.1",
   "testcontainers==4.15.0",
 ]
