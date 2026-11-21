@@ -43,12 +43,19 @@ def item(store: MemoryNewsStore, n: int, embedding: list[float], cluster_id: str
     return iid
 
 
+def cluster(store: MemoryNewsStore, cid: str = "c-old") -> str:
+    store.clusters[cid] = {"id": cid, "title": "Old story", "centroid": [0.6, 0.8], "entities": {}, "cve_ids": [], "severity": None, "status": "new",
+                           "first_seen": NOW - timedelta(hours=10), "last_seen": NOW - timedelta(hours=8)}
+    return cid
+
+
 async def test_window_vectors_of_the_old_model_are_re_embedded_newest_first(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(nd, "REEMBED_PER_RUN", 2)
     store = MemoryNewsStore()
     store.clock = lambda: NOW
+    cid = cluster(store)  # clustered by an earlier run, as every stored item is
     for n in range(3):
-        item(store, n, [0.6, 0.8])  # bge-small-era vectors (here: 2 dimensions)
+        item(store, n, [0.6, 0.8], cid)  # bge-small-era vectors (here: 2 dimensions)
     calls: list[list[str]] = []
     d = deps(store, 4, calls)
     await nd.dedupe_and_cluster(d, RunRecorder(store, "r1"), [], window_days=14)
@@ -58,6 +65,21 @@ async def test_window_vectors_of_the_old_model_are_re_embedded_newest_first(monk
     assert [len(store.items[f"item-{n}"]["embedding"]) for n in range(3)] == [4, 4, 4]
     await nd.dedupe_and_cluster(d, RunRecorder(store, "r3"), [], window_days=14)
     assert len(calls) == 2  # nothing stale any more: no embedding call
+
+
+async def test_items_a_failed_run_left_without_a_cluster_are_clustered_by_the_next_run() -> None:
+    # 2026-11-21 on mk4: dedupe linked an item to a cluster it had not saved yet (news_items_cluster_id_fkey), so the
+    # run failed with 273 items stored and none clustered. The feeds send them again, but they are not new any more.
+    store = MemoryNewsStore()
+    store.clock = lambda: NOW
+    left = [item(store, n, [1.0, 0.0, 0.0, 0.0]) for n in range(2)]
+    rec = RunRecorder(store, "r1")
+    touched = await nd.dedupe_and_cluster(deps(store, 4, []), rec, [], window_days=14)
+    assert rec.counters["dedupe_leftovers"] == 2
+    assert touched and all(store.items[i]["cluster_id"] in store.clusters for i in left)  # saved before it is linked
+    rec2 = RunRecorder(store, "r2")
+    assert await nd.dedupe_and_cluster(deps(store, 4, []), rec2, [], window_days=14) == []  # nothing left over now
+    assert "dedupe_leftovers" not in rec2.counters
 
 
 def test_a_centroid_of_the_old_model_is_rebuilt_from_current_member_vectors() -> None:

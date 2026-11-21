@@ -149,3 +149,25 @@ async def test_rollback_then_up_again(store: PgNewsStore) -> None:
             await c.execute(s)
         cur = await c.execute("select count(*)::int as n from information_schema.tables where table_schema = current_schema() and table_name like 'news_%%'")
         assert (await cur.fetchone())["n"] == 17
+
+
+async def test_dedupe_saves_a_new_cluster_before_it_links_the_items(store: PgNewsStore) -> None:
+    # 2026-11-21 on mk4: news_items_cluster_id_fkey refused linking an item to a cluster made in the same run, and every
+    # job run failed at dedupe. Here the foreign key is the real one (moks-cms 0017_news_desk.sql).
+    from app.news import desk as nd
+    from app.news.config import NewsSettings
+    from app.news.runlog import RunRecorder
+    from tests.conftest import settings
+
+    _, src = await seed(store)
+    ids = [i for i in [await store.insert_item(item(src, n)) for n in (1, 2)] if i]
+
+    async def embed(texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    d = nd.DeskDeps(store=store, web=None, llm=None, embed=embed, retriever=None, settings=settings(), news=NewsSettings(), clock=lambda: datetime.now(UTC),  # type: ignore[arg-type]
+                    extra={"news_embedding_model": "ollama:bge-m3:567m", "news_embedding_dim": 4})
+    touched = await nd.dedupe_and_cluster(d, RunRecorder(store, str(uuid.uuid4())), ids, window_days=14)
+    assert touched
+    linked = await store.items_by_cluster(touched)
+    assert sorted(str(i["id"]) for rows in linked.values() for i in rows) == sorted(ids)

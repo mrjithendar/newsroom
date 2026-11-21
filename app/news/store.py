@@ -579,6 +579,10 @@ class MemoryNewsStore:
         return iid
 
     async def update_item(self, item_id: str, **fields: Any) -> None:
+        # Like news_items_cluster_id_fkey in Postgres: an item can only point at a cluster that is already saved.
+        cid = fields.get("cluster_id")
+        if cid is not None and cid not in self.clusters:
+            raise ValueError(f"news_items.cluster_id {cid} is not in news_clusters")
         self.items[item_id].update(fields)
 
     async def items_by_cluster(self, cluster_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
