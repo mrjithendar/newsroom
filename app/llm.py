@@ -1,9 +1,9 @@
 """Claude access for every flow step and crew: Anthropic SDK client, budget guard, usage logging.
 
-- One admin budget for v2 and v4: usage rows go to the web app's `seo_llm_usage` table (same columns, same prices), so
-  SEO_LLM_MONTHLY_BUDGET_USD caps the legacy path and the agents together. Ask-the-Blog is separate: its rows (purpose
-  "ask…") never count against the admin budget, and it has its own daily cap (ASK_BLOG_DAILY_BUDGET_USD), which also
-  bounds its month (≤ 31 × daily).
+- One LLM budget for everything (app/llm_budgets.py): usage rows go to the web app's `seo_llm_usage` table (same
+  columns, same prices), and the admin's daily and monthly limits count every row of it, whatever the purpose.
+  Ask-the-Blog counts in it too and also has its own daily cap (ASK_BLOG_DAILY_BUDGET_USD), a guard against readers
+  running up spend. There is no SEO_LLM_MONTHLY_BUDGET_USD any more: a budget is set in the admin, and none is preset.
 - Before every call an upper-bound estimate (characters / 3.5 in, full max_tokens out) is checked; a call that could
   cross the cap is never sent (BudgetExceeded → the flow run moves to paused_budget).
 - Stable system text (rules, style guide) is sent as cached system blocks (cache_control ephemeral).
@@ -17,6 +17,7 @@ import json
 import math
 import os
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -27,7 +28,7 @@ from typing import Any, Protocol, TypeVar
 from pydantic import BaseModel
 
 from . import metrics, tracing
-from .llm_budgets import Limit, LimitsSource, period_end, period_start
+from .llm_budgets import Budget, BudgetSource, MemoryBudget, period_end, period_start
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -121,6 +122,7 @@ class SpendStore(Protocol):
     async def day_spend(self, now: datetime, purpose_prefix: str) -> float: ...
     async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float: ...
     async def llm_spend_by_model(self, month_start: datetime, day_start: datetime) -> list[dict[str, Any]]: ...
+    async def llm_spend_breakdown(self, since: datetime) -> list[dict[str, Any]]: ...
     async def record(self, row: dict[str, Any]) -> None: ...
 
 
@@ -190,6 +192,22 @@ class PgSpendStore:
             r["purposes"] = [*(r["purposes"] or []), "batch"]
         return list(by_key.values())
 
+    async def llm_spend_breakdown(self, since: datetime) -> list[dict[str, Any]]:
+        """Spend since `since` per provider, model and purpose (its first word), with the number of calls, plus legacy
+        batches in flight at their estimate (Anthropic, purpose "batch"). For GET /llm-budget: reporting only."""
+        async with self.pool.connection() as c:
+            cur = await c.execute(
+                "select provider, model, split_part(purpose, '.', 1) as purpose, coalesce(sum(cost_usd), 0)::float8 as usd, count(*)::int as calls"
+                " from seo_llm_usage where at >= %s group by 1, 2, 3",
+                (since,),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            cur = await c.execute(
+                "select model, coalesce(sum(estimated_cost_usd), 0)::float8 as usd, count(*)::int as calls from seo_llm_batches where status = 'in_progress' group by model"
+            )
+            rows += [{"provider": "anthropic", "model": b["model"], "purpose": "batch", "usd": float(b["usd"]), "calls": int(b["calls"])} for b in await cur.fetchall()]
+        return rows
+
     _attribution: bool | None = None  # seo_llm_usage has run_id/agent (web app migration 0022); checked once
 
     async def _has_attribution(self, c: Any) -> bool:
@@ -231,9 +249,10 @@ class MemorySpendStore:
         return sum(r["cost_usd"] for r in self.rows if r["purpose"].startswith(purpose_prefix))
 
     async def llm_spend(self, since: datetime, *, model: str | None = None, provider: str | None = None) -> float:
-        """Rows without an `at` count as now. Every row here is an Anthropic call."""
+        """Rows without an `at` count as now. Every row here is an Anthropic call. `preexisting_usd` (spend from before
+        the test began) counts in the total of every period, not for one model."""
         rows = [r for r in self.rows if r.get("at", since) >= since and (model is None or r["model"] == model) and provider in (None, "anthropic")]
-        return sum(r["cost_usd"] for r in rows)
+        return sum(r["cost_usd"] for r in rows) + (self.preexisting_usd if model is None and provider in (None, "anthropic") else 0.0)
 
     async def llm_spend_by_model(self, month_start: datetime, day_start: datetime) -> list[dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
@@ -248,6 +267,17 @@ class MemorySpendStore:
             m["purposes"] = sorted({*m["purposes"], r["purpose"].split(".")[0]})
         return list(out.values())
 
+    async def llm_spend_breakdown(self, since: datetime) -> list[dict[str, Any]]:
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for r in self.rows:
+            if r.get("at", since) < since:
+                continue
+            purpose = r["purpose"].split(".")[0]
+            g = out.setdefault((r["model"], purpose), {"provider": "anthropic", "model": r["model"], "purpose": purpose, "usd": 0.0, "calls": 0})
+            g["usd"] += r["cost_usd"]
+            g["calls"] += 1
+        return list(out.values())
+
     async def record(self, row: dict[str, Any]) -> None:
         self.rows.append(row)
 
@@ -256,118 +286,106 @@ class MemorySpendStore:
 class Reservation:
     """An in-flight call's upper-bound estimate, counted as spend until the call is booked (or fails)."""
 
-    scope: str | None  # "monthly" | "ask_daily" | None (news: its own caps)
+    scope: str | None  # "ask_daily" when the call also counts against Ask the Blog's own daily limit
     usd: float
     released: bool = False
-    model: str | None = None  # held against the model's and the provider's limits too (app/llm_budgets.py)
 
 
 PROVIDER = "anthropic"  # every call this service makes is a Claude call (seo_llm_usage.provider)
+HOLD_SECONDS = 900.0  # a hold taken over the API (POST /llm-budget/reserve) that is never settled lapses after this
+MAX_HOLDS = 500
 
+
+def used_up(status: dict[str, Any]) -> bool:
+    """Whether the one budget has nothing left for the day or the month (from BudgetGuard.status())."""
+    return any(
+        limit is not None and spent >= limit
+        for limit, spent in ((status["daily_budget_usd"], status["day_spend_usd"]), (status["monthly_budget_usd"], status["month_spend_usd"]))
+    )
 
 
 class BudgetGuard:
-    """Hard caps checked before every call.
+    """Hard caps checked before every call: the one LLM budget (app/llm_budgets.py) for every purpose, and on top of
+    it Ask the Blog's own daily limit for the public assistant. The news desk still checks its own caps before its
+    calls (app/news/budget.py); those come on top of the one budget, they do not replace it.
 
-    Concurrency: `reserve()` checks the cap and holds the call's upper-bound estimate as pending spend (per scope,
-    under an asyncio.Lock) until the call has been booked, so N concurrent calls cannot each read the same spend and
-    all pass. The reservation is in-process only: replicas do not see each other's pending calls (the service runs
-    one replica; a cross-replica reservation would need a row lock or an advisory lock on the shared table).
+    Concurrency: `reserve()` checks the caps and holds the call's upper-bound estimate as pending spend (under an
+    asyncio.Lock) until the call has been booked, so N concurrent calls cannot each read the same spend and all pass.
+    The reservation is in-process only: replicas do not see each other's pending calls (the service runs one replica;
+    a cross-replica reservation would need a row lock or an advisory lock on the shared table).
+
+    `monthly_usd` is a fixed monthly budget for when no budget store is given (tests, the in-memory mode). In the
+    service the budget comes from `budget` (the admin's saved limits) and `monthly_usd` is None.
     """
 
     def __init__(
         self,
         store: SpendStore,
-        monthly_usd: float,
-        ask_daily_usd: float,
+        monthly_usd: float | None = None,
+        ask_daily_usd: float = 0.0,
         clock: Callable[[], datetime] | None = None,
-        limits: LimitsSource | None = None,
+        budget: BudgetSource | None = None,
     ):
         self.store = store
-        self.monthly_usd = monthly_usd
         self.ask_daily_usd = ask_daily_usd
         self.clock = clock or (lambda: datetime.now(UTC))
-        self.limits = limits
+        self.budget: BudgetSource = budget if budget is not None else MemoryBudget(Budget(monthly_usd=monthly_usd))
         self._lock = asyncio.Lock()
-        self.pending: dict[str, float] = {"monthly": 0.0, "ask_daily": 0.0}
-        self.pending_models: dict[str, float] = {}  # in-flight estimates per model, for the LLM budgets
+        self.pending: dict[str, float] = {"total": 0.0, "ask_daily": 0.0}
+        self.holds: dict[str, tuple[Reservation, float]] = {}  # taken over the API, by id, with the time they lapse
+        self.monotonic: Callable[[], float] = time.monotonic  # the clock holds lapse by
 
-    @staticmethod
-    def _scope(purpose: str) -> str | None:
-        if purpose.startswith("news"):
-            return None  # the news desk has its own per-job and global caps (app/news/budget.py), checked before every call
-        return "ask_daily" if purpose.startswith("ask") else "monthly"
-
-    async def _llm_limits(self, model: str) -> tuple[Limit | None, Limit | None]:
-        if self.limits is None:
-            return None, None
-        lims = await self.limits.limits()
-        return lims.model(model), lims.provider(PROVIDER)
-
-    async def _check_llm_limits(self, model: str, est: float, now: datetime, own: Limit | None, total: Limit | None) -> None:
-        """The model's and the provider's own limits (app/llm_budgets.py), across every purpose:
-        spend this UTC day or month, plus the calls in flight here, plus this call's upper bound. Under the lock."""
-        checks = ((own, f"The {{unit}} budget of {model}", {"model": model}, self.pending_models.get(model, 0.0)),
-                  (total, f"The {{unit}} total for all {PROVIDER} models", {"provider": PROVIDER}, sum(self.pending_models.values())))
-        for lim, label, by, pending in checks:
-            if lim is None:
+    async def _check_budget(self, budget: Budget, est: float, now: datetime) -> None:
+        """The one budget, across every provider, model and purpose: spend this UTC day or month, plus the calls in
+        flight here, plus this call's upper bound. Under the lock."""
+        for unit, max_usd in (("day", budget.daily_usd), ("month", budget.monthly_usd)):
+            if max_usd is None:
                 continue
-            for unit, max_usd in (("day", lim.daily_usd), ("month", lim.monthly_usd)):
-                if max_usd is None:
-                    continue
-                used = await self.store.llm_spend(period_start(unit, now), **by) + pending
-                if used + est > max_usd or (used > 0 and used >= max_usd):
-                    word = "daily" if unit == "day" else "monthly"
-                    scope = f"llm_{'model' if 'model' in by else 'provider'}_{word}"
-                    metrics.BUDGET_BLOCKED.labels(scope=scope).inc()
-                    more = f", and this call could cost up to ${est:.2f}" if used < max_usd else ""
-                    reset = period_end(unit, now).strftime("%Y-%m-%d %H:%M UTC")
-                    raise BudgetExceeded(scope, f"{label.format(unit=word)} is reached: ${used:.2f} of ${max_usd:.2f} used {'today' if unit == 'day' else 'this month'}{more}."
-                                                f" It resets {reset}; change it in Admin → Automation & AI → LLM budgets.")
+            used = await self.store.llm_spend(period_start(unit, now)) + self.pending["total"]
+            if used + est > max_usd or (used > 0 and used >= max_usd):
+                word = "daily" if unit == "day" else "monthly"
+                metrics.BUDGET_BLOCKED.labels(scope=f"llm_{word}").inc()
+                more = f", and this call could cost up to ${est:.2f}" if used < max_usd else ""
+                reset = period_end(unit, now).strftime("%Y-%m-%d %H:%M UTC")
+                raise BudgetExceeded(
+                    f"llm_{word}",
+                    f"The {word} LLM budget is reached: ${used:.2f} of ${max_usd:.2f} used {'today' if unit == 'day' else 'this month'}{more}."
+                    f" It resets {reset}; change it in Admin → AI & SEO → Settings → LLM budget.",
+                )
 
-    async def _admit(self, model: str, input_chars: int, max_tokens: int, purpose: str, hold: bool) -> Reservation:
-        est = estimate_cost_usd(model, input_chars, max_tokens)
-        scope = self._scope(purpose)
-        own, total = await self._llm_limits(model)
-        if scope is None and own is None and total is None:
-            return Reservation(None, 0.0, released=True)
+    async def _admit_usd(self, est: float, purpose: str, hold: bool) -> Reservation:
+        budget = await self.budget.budget()
+        scope = "ask_daily" if purpose.startswith("ask") else None
         async with self._lock:
             now = self.clock()
-            if own is not None or total is not None:
-                await self._check_llm_limits(model, est, now, own, total)
-            if scope == "monthly":
-                month = await self.store.month_spend(now)
-                if month + self.pending["monthly"] + est > self.monthly_usd:
-                    metrics.BUDGET_BLOCKED.labels(scope="monthly").inc()
-                    raise BudgetExceeded("monthly", f"monthly LLM budget ${self.monthly_usd:.2f} would be exceeded (spent ${month:.2f})")
-            elif scope == "ask_daily":
+            self._lapse()
+            await self._check_budget(budget, est, now)
+            if scope == "ask_daily":
                 day = await self.store.day_spend(now, "ask")
                 if day + self.pending["ask_daily"] + est > self.ask_daily_usd:
                     metrics.BUDGET_BLOCKED.labels(scope="ask_daily").inc()
                     raise BudgetExceeded("ask_daily", f"daily Ask-the-Blog budget ${self.ask_daily_usd:.2f} reached")
             if not hold:
                 return Reservation(scope, 0.0, released=True)
+            self.pending["total"] += est
             if scope is not None:
                 self.pending[scope] += est
-            self.pending_models[model] = self.pending_models.get(model, 0.0) + est
-            return Reservation(scope, est, model=model)
+            return Reservation(scope, est)
+
+    async def _admit(self, model: str, input_chars: int, max_tokens: int, purpose: str, hold: bool) -> Reservation:
+        return await self._admit_usd(estimate_cost_usd(model, input_chars, max_tokens), purpose, hold)
 
     async def ensure(self, model: str, input_chars: int, max_tokens: int, purpose: str) -> None:
-        """Check only (no reservation): would this call fit under its cap, counting the calls in flight?"""
+        """Check only (no reservation): would this call fit under its caps, counting the calls in flight?"""
         await self._admit(model, input_chars, max_tokens, purpose, hold=False)
 
     def release(self, r: Reservation) -> None:
         if r.released:
             return
         r.released = True
+        self.pending["total"] = max(0.0, self.pending["total"] - r.usd)
         if r.scope is not None:
             self.pending[r.scope] = max(0.0, self.pending[r.scope] - r.usd)
-        if r.model is not None:
-            left = self.pending_models.get(r.model, 0.0) - r.usd
-            if left > 1e-12:
-                self.pending_models[r.model] = left
-            else:
-                self.pending_models.pop(r.model, None)
 
     @asynccontextmanager
     async def reserve(self, model: str, input_chars: int, max_tokens: int, purpose: str) -> AsyncIterator[Reservation]:
@@ -380,10 +398,45 @@ class BudgetGuard:
         finally:
             self.release(r)
 
-    async def status(self) -> dict[str, float]:
+    # --- Holds for callers outside this process (the web app's own LLM calls) -------------------------------------
+
+    def _lapse(self) -> None:
+        now = self.monotonic()
+        for key in [k for k, (_, until) in self.holds.items() if until <= now]:
+            self.release(self.holds.pop(key)[0])
+
+    async def hold(self, max_usd: float, purpose: str) -> str:
+        """Checks the caps for a call someone else is about to make and holds its upper bound (the caller's own
+        estimate: this service does not know every model's price) until settle(), or for HOLD_SECONDS when the
+        caller never comes back. Returns the hold's id. BudgetExceeded when it does not fit."""
+        if len(self.holds) >= MAX_HOLDS:
+            self._lapse()
+            if len(self.holds) >= MAX_HOLDS:
+                raise BudgetExceeded("llm_holds", "too many LLM calls are being held at once; try again shortly")
+        r = await self._admit_usd(max_usd, purpose, hold=True)
+        key = uuid.uuid4().hex
+        self.holds[key] = (r, self.monotonic() + HOLD_SECONDS)
+        return key
+
+    def settle(self, key: str) -> bool:
+        """Lets go of a hold. The caller records its own usage row; from then on that row is the spend. False when
+        the hold is unknown or has lapsed (which is fine: nothing is held)."""
+        held = self.holds.pop(key, None)
+        if held is None:
+            return False
+        self.release(held[0])
+        return True
+
+    async def status(self) -> dict[str, Any]:
         now = self.clock()
-        month = await self.store.month_spend(now)
-        return {"monthly_budget_usd": self.monthly_usd, "month_spend_usd": month, "ask_day_spend_usd": await self.store.day_spend(now, "ask")}
+        budget = await self.budget.budget()
+        return {
+            "daily_budget_usd": budget.daily_usd,
+            "monthly_budget_usd": budget.monthly_usd,
+            "day_spend_usd": await self.store.llm_spend(period_start("day", now)),
+            "month_spend_usd": await self.store.llm_spend(period_start("month", now)),
+            "ask_day_spend_usd": await self.store.day_spend(now, "ask"),
+        }
 
     async def record(
         self,

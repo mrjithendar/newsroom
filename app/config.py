@@ -110,7 +110,6 @@ class Settings:
     anthropic_api_key: str = ""
     draft_model: str = "claude-sonnet-5-5"
     classify_model: str = "claude-haiku-5-5"
-    monthly_budget_usd: float = 15.0  # v5: COSTS.md estimates the admin month at $8–10.5
     ask_daily_budget_usd: float = 1.0
     ask_enabled: bool = False
     # D-93: copy the article index into LanceDB on R2 after each reindex (/admin/lancedb → article_chunks).
@@ -225,7 +224,6 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", ""),
         draft_model=env.get("SEO_DRAFT_MODEL", "").strip() or Settings.draft_model,
         classify_model=env.get("SEO_CLASSIFY_MODEL", "").strip() or Settings.classify_model,
-        monthly_budget_usd=_float("SEO_LLM_MONTHLY_BUDGET_USD", Settings.monthly_budget_usd, env),
         ask_daily_budget_usd=_float("ASK_BLOG_DAILY_BUDGET_USD", Settings.ask_daily_budget_usd, env),
         ask_enabled=_bool("ASK_BLOG_ENABLED", False, env),
         lancedb_article_index=_bool("LANCEDB_ARTICLE_INDEX", True, env),
