@@ -220,7 +220,7 @@ class NewsJobFlow(NewsHelpers, SeoFlow[NewsJobState]):
             s.result = {"reason": f"slot {s.slot} already ran (run {s.news_run_id})"}
             return
         if not d.news.enabled:
-            rec.log("warning", "news desk is switched off (NEWS_DESK_ENABLED or Settings → paused); nothing ran", outcome="disabled")
+            rec.log("warning", "news desk is switched off (Newsroom → Settings, or NEWS_DESK_ENABLED=false in the deployment); nothing ran", outcome="disabled")
             await self.close_run(d, rec, "skipped", "news desk disabled", job, started)
             s.outcome = "skipped"
             return
