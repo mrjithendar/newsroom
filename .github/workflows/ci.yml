@@ -1,6 +1,6 @@
 name: news-agent
 
-# One job per run, on one mk4 runner, so a run never holds more than one runner pod (plus its dind and PostgreSQL):
+# One job per run, on one GitHub-hosted arm64 runner (runs-on: ubuntu-24.04-arm):
 #
 # - Every run: ruff, mypy, pytest (with a PostgreSQL service, so the run-store scoping, persistence and the news
 #   store tests run), and pip-audit of the locked production dependencies. The moks-cms contract tests read moks-cms
@@ -39,7 +39,7 @@ concurrency:
 jobs:
   ci:
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && (github.event.action != 'closed' || github.event.pull_request.merged == true))
-    runs-on: mk4
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     # Merged pull requests release one at a time (and only the newest waiting one: each merge commit contains the
     # ones before it). Other runs get a group of their own.
@@ -60,7 +60,7 @@ jobs:
       NEWS_AGENT_TEST_DATABASE_URL: postgresql://postgres:ci-only-not-secret@localhost:5432/news_agent_test
       UV_PYTHON_DOWNLOADS: never
       # The image's thread limits (Dockerfile): without them OpenMP/OpenBLAS (LightGBM, scikit-learn, NumPy) and the
-      # tokenizers start one thread per core of the mk4 node, not of the runner pod.
+      # tokenizers start one thread per core of the host, not of the container.
       OMP_NUM_THREADS: "2"
       RAYON_NUM_THREADS: "1"
       TOKENIZERS_PARALLELISM: "false"
@@ -94,7 +94,7 @@ jobs:
         # Isolated: pip-audit's own dependencies conflict with crewai's pins, so it audits an exported requirements file.
         # The export pins and hashes every transitive dependency, so --disable-pip audits it as is instead of having pip
         # resolve all of it again in a throwaway virtualenv. --cache-dir: pip-audit's default cache (platformdirs, under
-        # ~/.cache) refuses a world-writable home directory, which the mk4 runner image has ("PermissionError:
+        # ~/.cache) refuses a world-writable home directory, which the old mk4 runner image had ("PermissionError:
         # /home/runner, writable by another user").
         run: |
           set -euo pipefail
