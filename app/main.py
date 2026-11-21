@@ -13,6 +13,8 @@ and /metrics needs `Authorization: Bearer $NEWS_AGENT_TOKEN`:
     GET  /flows/runs                    ?flow=&status=&limit= (this service's runs only)
     GET  /flows/runs/{run_id}           status, current step, outputs, errors, cost
     POST /flows/runs/{run_id}/cancel
+    GET  /admin-settings                settings an admin may change: schema, effective values, source, restart pending
+    PUT  /admin-settings/{group}        {values, actor} → one group, validated, all or nothing (app/admin_settings)
     GET  /healthz /readyz /metrics
 
 Nothing here publishes: a news draft is published by the seo-agent's publish_flow after a person approves it in the
@@ -36,6 +38,12 @@ from prometheus_client import generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import metrics
+from .admin_settings import MemorySettingsStore, PgSettingsStore, SettingsInvalid, UnknownGroup
+from .admin_settings import overview as settings_overview
+from .admin_settings import save_group as save_settings_group
+from .admin_settings.store import REFRESH_SECONDS as SETTINGS_REFRESH_SECONDS
+from .admin_settings.store import apply_live as apply_live_settings
+from .admin_settings.store import effective as effective_settings
 from .config import Settings, load_settings
 from .crews import config as crew_config
 from .embeddings import HashEmbeddings
@@ -92,6 +100,7 @@ class Container:
     schedules: Any = field(default_factory=MemoryScheduleStore)  # seo_flow_schedules, the news rows (app/schedules.py)
     clock: Callable[[], Any] | None = None  # tests: the dispatcher's "now"
     seo_agent: SeoAgentClient | None = None
+    admin_settings: Any = field(default_factory=MemorySettingsStore)  # values saved from the admin (app/admin_settings)
 
 
 def _news(deps: Deps, store: Any, embeddings: Any) -> None:
@@ -119,12 +128,22 @@ async def build_container(settings: Settings) -> Container:
     pool = AsyncConnectionPool(settings.database_url, min_size=1, max_size=6, open=False, kwargs=kw)
     await pool.open(wait=True, timeout=30)
     sync_pool = ConnectionPool(settings.database_url, min_size=1, max_size=2, open=True, kwargs=kw)  # CrewAI persistence
+    reasons: list[str] = []
+    # Values an admin saved (Newsroom → Settings → News agent) win over the environment. Read before anything below is
+    # built, so components that copy a value at start-up (the Claude key, timeouts) get the saved one. The connection
+    # and the tokens always come from the environment: none of them can be saved from the admin.
+    admin_settings = PgSettingsStore(pool)
+    try:
+        await admin_settings.ensure_schema()
+        settings = effective_settings(await admin_settings.load(fresh=True))
+    except Exception as e:  # the role cannot create the table, or the database is down: the deployment's values
+        reasons.append(f"admin settings table not available: {type(e).__name__}")
+        log.warning("admin settings not loaded", extra={"event": "admin_settings_load_failed"})
     seo = SeoAgentClient(settings.seo_agent_url, settings.seo_agent_token)
     guard = RemoteBudgetGuard(PgSpendStore(pool), seo)
     web = HttpWebApp(settings.callback_url, settings.callback_token)
     history = RunHistory(PgHistorySink(pool), web.run_history_settings)
     llm = RecordingLlm(AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s), history)
-    reasons: list[str] = []
     if not seo.configured:
         reasons.append("no seo-agent set up (SEO_AGENT_URL, SEO_AGENT_NEWS_TOKEN): no site search, and LLM calls are not checked against the one LLM budget")
     store = PgRunStore(pool, OWNED_FLOWS)
@@ -132,7 +151,7 @@ async def build_container(settings: Settings) -> Container:
     _news(deps, PgNewsStore(pool), make_embeddings(settings))
     runner = FlowRunner(SPECS, store, PgAdvisoryLocks(settings.database_url), lambda: PgFlowPersistence().bind(sync_pool), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
-    return Container(settings=settings, deps=deps, runner=runner, store=store, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), seo_agent=seo)
+    return Container(settings=settings, deps=deps, runner=runner, store=store, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), seo_agent=seo, admin_settings=admin_settings)
 
 
 def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any = None, history: bool = False) -> Container:
@@ -200,6 +219,18 @@ async def _gauges(c: Container) -> None:
         await asyncio.sleep(60)
 
 
+async def _settings_refresh(c: Container) -> None:
+    """Live settings saved through another replica (or straight in the table) reach this process within one period."""
+    while True:
+        await asyncio.sleep(SETTINGS_REFRESH_SECONDS)
+        try:
+            changed = apply_live_settings(c.settings, await c.admin_settings.load())
+            if changed:
+                log.info("admin settings applied", extra={"event": "admin_settings_applied", "settings": changed})
+        except Exception:  # noqa: S110 - the next period tries again; the running values stay
+            pass
+
+
 async def startup(c: Container) -> None:
     try:
         await c.runner.recover()
@@ -208,6 +239,7 @@ async def startup(c: Container) -> None:
         log.warning("run recovery failed", extra={"event": "recover_failed"})
     c.ready = True
     c.bg.append(asyncio.create_task(_gauges(c)))
+    c.bg.append(asyncio.create_task(_settings_refresh(c)))
     if c.history is not None:  # started here, outside any run, so the writer's own log lines never enter a run's log
         install_run_log(c.history)
         c.bg.append(asyncio.create_task(c.history.run_forever()))
@@ -327,6 +359,27 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.post("/flows/runs/{run_id}/cancel", dependencies=[Depends(auth)])
     async def cancel_run(run_id: str, request: Request) -> dict[str, Any]:
         return await ctr(request).runner.cancel(run_id)
+
+    @app.get("/admin-settings", dependencies=[Depends(auth)])
+    async def admin_settings(request: Request) -> dict[str, Any]:
+        c = ctr(request)
+        return settings_overview(await c.admin_settings.load(fresh=True), c.settings)
+
+    @app.put("/admin-settings/{group}", dependencies=[Depends(auth)])
+    async def save_admin_settings(group: str, request: Request) -> Any:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "send a JSON object"}, status_code=422)
+        c = ctr(request)
+        try:
+            return await save_settings_group(c.admin_settings, c.settings, group, body.get("values"), body.get("actor"))
+        except UnknownGroup:
+            return JSONResponse({"error": "no such settings group"}, status_code=404)
+        except SettingsInvalid as e:
+            return JSONResponse({"error": "the settings are not valid", "issues": e.issues}, status_code=422)
 
     return app
 

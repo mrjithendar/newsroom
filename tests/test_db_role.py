@@ -39,6 +39,9 @@ DYNAMIC: dict[str, set[str]] = {
 }
 # The same word as a table, used for something else.
 NOT_A_TABLE: set[str] = set()
+# Created by the agent itself (app/admin_settings/store.py) and owned by its role.
+OWNED = ("news_agent_settings",)
+SETTINGS_DDL = "(key text primary key, value jsonb not null, updated_by text, updated_at timestamptz not null default now())"
 # Granted on these columns only, never on the table.
 BY_COLUMN: dict[str, dict[str, set[str]]] = {
     "seo_flow_schedules": {"UPDATE": {"last_slot", "last_fired_at", "last_status", "last_run_id", "last_error"}},
@@ -177,6 +180,8 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                 await c.execute("create table schema_migrations (name text primary key, applied_at timestamptz not null default now())")
                 for stmt in migrations:
                     await c.execute(stmt)
+                # As in production before the role existed: the agent created its table with the web app's role.
+                await c.execute(f"create table {OWNED[0]} {SETTINGS_DDL}")
                 await c.execute(script)
                 await c.execute(script)  # safe to run again
 
@@ -184,7 +189,7 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                 wanted = required(tables)
                 for table, columns in BY_COLUMN.items():
                     wanted[table] = wanted.get(table, set()) - set(columns)
-                for table in sorted(tables):
+                for table in sorted(tables - set(OWNED)):
                     for privilege in PRIVILEGES:
                         has = await one(c, "select has_table_privilege(%s::name, %s::text, %s::text)", ROLE, f'public."{table}"', privilege)
                         if has != (privilege in wanted.get(table, set())):
@@ -198,8 +203,11 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                             if has != (column in allowed):
                                 problems.append(f"{table}.{column}: {privilege} is {'granted' if has else 'missing'}")
 
+                assert await one(c, "select tableowner from pg_tables where schemaname = 'public' and tablename = %s", OWNED[0]) == ROLE
+
                 # And as the role itself: what the agent does works, the rest does not.
                 await c.execute(f"set role {ROLE}")
+                await c.execute("insert into news_agent_settings (key, value) values ('CREW_MAX_ITER', '4') on conflict (key) do nothing")
                 await c.execute("select id, title from post limit 1")
                 await c.execute("select value from setting limit 1")
                 for forbidden in (
@@ -212,7 +220,6 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                     "select 1 from seo_gsc_page_daily",
                     "update seo_drafts set status = 'approved'",
                     "update seo_flow_schedules set enabled = false",
-                    "create table x(id int)",  # no space before "(": the schema contract scan reads test sources
                 ):
                     with pytest.raises(InsufficientPrivilege):
                         await c.execute(forbidden)
