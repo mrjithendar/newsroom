@@ -21,6 +21,9 @@ Every endpoint except /healthz, /readyz and /metrics needs `Authorization: Beare
     POST /llm-budget/settle             {id} → let go of a hold (the caller has recorded its usage row)
     GET  /llm-budgets                   before the one budget: spend by model and provider, no limits (older web app)
     PUT  /llm-budgets                   409: replaced by /llm-budget
+    GET  /llm-providers                 provider kinds, saved providers and their models; a key is never returned
+    PUT  /llm-providers                 one provider (+ its models), validated, all or nothing (app/llm_providers)
+    GET  /llm-models                    models that are switched on, of providers that are on (for pickers)
     GET  /admin-settings                settings an admin may change: schema, effective values, source, restart pending
     PUT  /admin-settings/{group}        {values, actor} → one group, validated, all or nothing (app/admin_settings)
     GET  /healthz /readyz /metrics
@@ -72,6 +75,9 @@ from .lance_index import ArticleMirror, fetch_from
 from .llm import AnthropicLlm, BudgetExceeded, BudgetGuard, MemorySpendStore, PgSpendStore
 from .llm_budgets import REPLACED, BudgetIn, MemoryBudget, PgBudget, legacy_overview
 from .llm_budgets import overview as llm_overview
+from .llm_providers import Invalid as ProviderInvalid
+from .llm_providers import MemoryProviderStore, PgProviderStore, ProviderIn, check_catalog, enabled_models, save_provider
+from .llm_providers import overview as providers_overview
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
 from .run_history import MemoryHistorySink, PgHistorySink, RecordingLlm, RunHistory
@@ -154,6 +160,7 @@ class Container:
     clock: Callable[[], Any] | None = None  # tests: the dispatcher's "now"
     budgets: Any = field(default_factory=MemoryBudget)  # the one LLM budget (app/llm_budgets.py)
     admin_settings: Any = field(default_factory=MemorySettingsStore)  # values saved from the admin (app/admin_settings)
+    providers: Any = field(default_factory=MemoryProviderStore)  # LLM providers and models (app/llm_providers)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
         async with self.reindex_lock:
@@ -259,7 +266,7 @@ async def build_container(settings: Settings) -> Container:
     deps.runner = runner
     # The admin's Ask the Blog settings (web app → `setting` row "ask_blog") apply on top of the environment's switch.
     ask = AskService(AskPipeline(deps), index, PgAskLog(pool), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=PgAskRuntime(pool), guard=guard)
-    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), budgets=budgets, admin_settings=admin_settings)
+    c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=index, guard=guard, pool=pool, sync_pool=sync_pool, reasons=reasons, history=history, schedules=PgScheduleStore(pool), budgets=budgets, admin_settings=admin_settings, providers=PgProviderStore(pool))
     c.lance = lance_from_env(dict(os.environ), resolve=web.lancedb_storage)
     c.mirror = ArticleMirror(c.lance, fetch_from(pool), enabled=settings.lancedb_article_index)
     deps.reindex = c.reindex
@@ -386,6 +393,12 @@ async def startup(c: Container) -> None:
     mode = getattr(getattr(c.index, "config", None), "mode", "vector")
     for m in metrics.RAG_MODES:
         metrics.RAG_RETRIEVAL_MODE.labels(mode=m).set(1 if m == mode else 0)
+    check_catalog()
+    try:
+        await c.providers.ensure_schema()
+    except Exception as e:  # the role cannot create it, or the database is down: providers cannot be saved until it can
+        c.reasons.append(f"LLM providers tables not available: {type(e).__name__}")
+        log.warning("llm providers schema failed", extra={"event": "llm_providers_schema_failed"})
     try:
         await c.budgets.ensure_schema()
     except Exception as e:  # the role cannot create it, or the database is down: no LLM budgets until it can
@@ -638,6 +651,34 @@ def create_app(container: Container | None = None) -> FastAPI:
     @app.put("/llm-budgets", dependencies=[Depends(auth)])
     async def save_llm_budgets() -> Any:
         return JSONResponse({"error": REPLACED}, status_code=409)
+
+    @app.get("/llm-providers", dependencies=[Depends(auth)])
+    async def llm_providers(request: Request) -> dict[str, Any]:
+        return await providers_overview(ctr(request).providers)
+
+    @app.put("/llm-providers", dependencies=[Depends(auth)])
+    async def save_llm_provider(request: Request) -> Any:
+        """One provider and, when `models` is sent, all of its models. The key is write-only: it is sealed, never
+        logged and never returned."""
+        try:
+            body = ProviderIn.model_validate(await request.json())
+        except ValidationError as e:
+            # Messages only, never the input: a rejected body may hold a key.
+            issues = [f"{'.'.join(str(p) for p in err['loc']) or 'body'}: {err['msg']}" for err in e.errors(include_input=False)][:30]
+            return JSONResponse({"error": "the provider is not valid", "issues": issues}, status_code=422)
+        except ValueError:
+            return JSONResponse({"error": "send a JSON object"}, status_code=422)
+        c = ctr(request)
+        try:
+            changed = await save_provider(c.providers, body)
+        except ProviderInvalid as e:
+            return JSONResponse({"error": "the provider is not valid", "issues": e.issues[:30]}, status_code=422)
+        log.info("llm provider saved", extra={"event": "llm_provider_saved", "provider": changed["id"], "enabled": changed["enabled"], "key_changed": changed["key_changed"], "models": changed["models"]})
+        return {"saved": changed, **(await providers_overview(c.providers))}
+
+    @app.get("/llm-models", dependencies=[Depends(auth)])
+    async def llm_models(request: Request) -> dict[str, Any]:
+        return {"models": await enabled_models(ctr(request).providers)}
 
     @app.get("/admin-settings", dependencies=[Depends(auth)])
     async def admin_settings(request: Request) -> dict[str, Any]:

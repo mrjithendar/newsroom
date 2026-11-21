@@ -53,6 +53,27 @@ provider's own spend limit stops spending.
   `seo_agent_llm_budgets` are left in place and shown read-only as `legacy_limits`; `GET /llm-budgets` still answers
   an older web app with spend and no limits, and `PUT /llm-budgets` answers 409.
 
+
+## LLM providers and models
+
+`app/llm_providers/`: which providers exist (`catalog.py`) and what an admin has set up (`store.py`, tables
+`seo_agent_llm_providers` and `seo_agent_llm_models`, created at start-up).
+
+- **Catalog.** Anthropic, OpenAI, Google Gemini, Azure OpenAI, AWS Bedrock, Mistral, xAI and "Custom
+  OpenAI-compatible". Each entry was checked against the provider's own docs and cites the page and the date. The
+  catalog holds no model list and no price. Named in the plan and not yet checked, so reachable only through
+  "Custom" for now: DeepSeek, Groq, Cohere, Perplexity, Together AI, Fireworks AI, OpenRouter, Ollama.
+- **Keys.** Sealed with `SEO_AGENT_SETTINGS_KEY` (AES-256-GCM). Write-only: a key is never returned, logged or sent
+  to the browser; the API says `saved`, `env`, `none` or `not_needed`. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in the
+  environment are used when no key is saved.
+- **Prices.** Never invented. A model cannot be switched on until its input and output prices (USD per million
+  tokens) are entered, unless it is a Claude model with a built-in price (`app/llm.py` `PRICES`) or it is marked free.
+- **API.** `GET /llm-providers`, `PUT /llm-providers` (one provider and, when `models` is sent, all of its models;
+  validated, all or nothing), `GET /llm-models` (models that are on, for pickers).
+- **Not yet.** Nothing calls a provider from these tables: every job still calls Anthropic as before. The adapters,
+  "Fetch models", "Test", and the model for each job come in later changes; until then Anthropic cannot be switched
+  off here.
+
 ## Settings an admin can change
 
 Some settings can be changed from the web app (Admin → AI & SEO → Settings) instead of the deployment's environment.
