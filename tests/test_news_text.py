@@ -154,7 +154,16 @@ def test_kill_switch_defaults_off_and_settings_can_only_pause() -> None:
     assert not load_news_settings(None, {}).enabled
     assert load_news_settings({"paused": False}, {"NEWS_DESK_ENABLED": "true"}).enabled
     assert not load_news_settings({"paused": True}, {"NEWS_DESK_ENABLED": "true"}).enabled
-    assert not load_news_settings({"paused": False, "env_enabled": True}, {}).enabled  # a setting row cannot switch it on
+    assert not load_news_settings({"paused": False, "env_enabled": True}, {}).enabled  # the row cannot fake the deployment's value
+    # P5: the admin's switch (row key "enabled") decides once saved; NEWS_DESK_ENABLED=false is the emergency override.
+    assert load_news_settings({"enabled": True}, {}).enabled
+    assert not load_news_settings({"enabled": False}, {"NEWS_DESK_ENABLED": "true"}).enabled
+    assert not load_news_settings({"enabled": True, "paused": True}, {}).enabled  # an old pause is still honoured
+    for off in ("false", "0", "off", "no"):
+        assert not load_news_settings({"enabled": True}, {"NEWS_DESK_ENABLED": off}).enabled
+    assert not load_news_settings({"enabled": "yes"}, {}).enabled  # not a boolean: treated as never saved
+    assert not load_news_settings({"desk_enabled": True, "env_forced_off": False}, {"NEWS_DESK_ENABLED": "false"}).enabled
+    assert load_news_settings({"enabled": True, "max_drafts_per_day": 3}, {}).max_drafts_per_day == 3  # the rest of the row still loads
     assert load_news_settings({}, {"NEWS_IMAGE_PROVIDER": "gemini"}).image_provider == "gemini"
 
 

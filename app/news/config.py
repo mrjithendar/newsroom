@@ -2,8 +2,9 @@
 tests/test_news_config.py and the web test news-desk.test.ts both parse docs/news/fixtures/job-config.json so the two
 stay in step.
 
-The kill switch is NEWS_DESK_ENABLED (env, default false). The admin Settings page can pause the desk (setting row
-`news`.paused) but cannot switch it on when the environment says off.
+The switch is the admin's (setting row `news`.enabled, Newsroom → Settings). NEWS_DESK_ENABLED=false in the
+deployment is an emergency override that forces the desk off. Until the admin first saves the switch,
+NEWS_DESK_ENABLED=true keeps the desk on, as before the switch existed.
 """
 
 from __future__ import annotations
@@ -158,8 +159,10 @@ class NewsSettings(BaseModel):
     """Setting row `news` (web admin → Settings), plus the environment switches."""
 
     model_config = ConfigDict(extra="ignore")
-    env_enabled: bool = False
-    paused: bool = False
+    env_enabled: bool = False  # NEWS_DESK_ENABLED is true in the deployment
+    env_forced_off: bool = False  # NEWS_DESK_ENABLED is false in the deployment: off, whatever the admin switch says
+    desk_enabled: bool | None = None  # the admin's switch (row key "enabled"); None until it is first saved
+    paused: bool = False  # the earlier pause box; still honoured when a row has it
     llm_daily_usd: float = 2.0
     llm_monthly_usd: float = 20.0
     image_daily_usd: float = 1.0
@@ -191,6 +194,13 @@ class NewsSettings(BaseModel):
 
     @property
     def enabled(self) -> bool:
+        """The same rule as the web app's newsDeskState (moks-cms src/lib/news/schema.ts):
+        the deployment's false wins; then the admin's switch once saved; never saved, the deployment's true keeps
+        the desk on as before the switch existed."""
+        if self.env_forced_off:
+            return False
+        if self.desk_enabled is not None:
+            return self.desk_enabled and not self.paused
         return self.env_enabled and not self.paused
 
 
@@ -199,9 +209,17 @@ def env_enabled(env: dict[str, str] | None = None) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def env_forced_off(env: dict[str, str] | None = None) -> bool:
+    """NEWS_DESK_ENABLED explicitly false: the emergency override. Unset or anything else is not an override."""
+    v = (env if env is not None else os.environ).get("NEWS_DESK_ENABLED", "").strip().lower()
+    return v in ("0", "false", "no", "off")
+
+
 def load_news_settings(row: dict[str, Any] | None, env: dict[str, str] | None = None) -> NewsSettings:
     e = env if env is not None else dict(os.environ)
     data = dict(row or {})
+    switch = data.pop("enabled", None)
+    data.pop("env_enabled", None), data.pop("env_forced_off", None), data.pop("desk_enabled", None)  # never from the row
     provider = e.get("NEWS_IMAGE_PROVIDER", "").strip().lower()
     if provider in ("template", "gemini", "openai"):
         data["image_provider"] = provider
@@ -209,4 +227,4 @@ def load_news_settings(row: dict[str, Any] | None, env: dict[str, str] | None = 
         s = NewsSettings.model_validate(data)
     except ValueError:
         s = NewsSettings()
-    return s.model_copy(update={"env_enabled": env_enabled(e)})
+    return s.model_copy(update={"env_enabled": env_enabled(e), "env_forced_off": env_forced_off(e), "desk_enabled": switch if isinstance(switch, bool) else None})

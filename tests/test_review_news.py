@@ -13,7 +13,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-from app.llm import BudgetExceeded, CallSpec, Usage, estimate_cost_usd
+from app.llm import BudgetExceeded, CallSpec, Usage
+from app.llm_budgets import Budget
 from app.metrics import REGISTRY
 from app.news import classifier as clf
 from app.news import desk as nd
@@ -75,17 +76,24 @@ async def test_with_news_llm_caps_and_books_ingest_classification(llm: Any) -> N
     llm.queue("news.classify", TopicLabels(items=[{"i": 0, "topics": ["kubernetes"]}]))
     assert await nd.claude_labels(d, ["kubernetes pod"], TOPICS) == [["kubernetes"]]
     assert store.runs["r-ingest"]["cost_usd"] > 0  # booked to news_runs
-    capped = nd.with_news_llm(deps(llm, store, llm_daily_usd=0.0), ["r-ingest"])
-    with pytest.raises(BudgetExceeded):
-        await nd.claude_labels(capped, ["kubernetes pod"], TOPICS)
+    # There is no news LLM cap any more: an old value in the row is ignored...
+    old_cap = nd.with_news_llm(deps(llm, store, llm_daily_usd=0.0), ["r-ingest"])
+    llm.queue("news.classify", TopicLabels(items=[{"i": 0, "topics": ["kubernetes"]}]))
+    assert await nd.claude_labels(old_cap, ["kubernetes pod"], TOPICS) == [["kubernetes"]]
+    # ...and the one LLM budget is what refuses a news call.
+    llm.guard.budget.value = Budget(daily_usd=1e-9)
+    with pytest.raises(BudgetExceeded) as e:
+        await nd.claude_labels(nd.with_news_llm(deps(llm, store), ["r-ingest"]), ["kubernetes pod"], TOPICS)
+    assert e.value.scope == "llm_daily"
 
 
-async def test_job_ingest_fallback_respects_the_global_cap_and_labels_low_confidence(llm: Any) -> None:
+async def test_job_ingest_fallback_respects_the_llm_budget_and_labels_low_confidence(llm: Any) -> None:
     from tests.test_news_flows import SAFE
 
     llm.queue("news.vision", SAFE)
     c, _web, store = setup(llm)
-    store.settings = {"max_drafts_per_day": 10, "llm_daily_usd": 0.0}  # every news LLM call is over the cap
+    store.settings = {"max_drafts_per_day": 10}
+    llm.guard.budget.value = Budget(daily_usd=1e-9)  # the one LLM budget: nothing spent yet, but no call fits
     m = flat_classifier()
     store.models.append({"kind": "classifier", "version": m.version, "active": True, "artifact": m.to_bytes(), "metrics": {}, "trained_at": NOW})
     await run(c, "news_job_flow", {"job_id": JOB})
@@ -456,18 +464,22 @@ class SlowLlm:
         return schema.model_validate({"items": []}), Usage(spec.model, input_tokens=100, output_tokens=10)
 
 
-async def test_concurrent_calls_cannot_jointly_overspend() -> None:
+async def test_the_news_desk_has_no_llm_cap_of_its_own_and_books_every_call() -> None:
+    # Concurrent calls and overspending are the one LLM budget's job (tests/test_llm_budgets.py). Here: an old news
+    # cap of 0 in the row refuses nothing, and each call's actual cost lands on the news run.
     store = mem_store()
     await store.create_run({"id": "r1", "kind": "ingest", "job_id": None})
     spec = CallSpec(model="claude-haiku-5-5", purpose="news.classify", prompt_version="t", cached_system=[], user="x" * 700, max_tokens=1500)
-    est = estimate_cost_usd(spec.model, spec.input_chars, spec.max_tokens)
     inner = SlowLlm()
-    llm = NewsLlm(inner, NewsBudget(store, NewsSettings(llm_daily_usd=est * 1.5), None, "r1", lambda: NOW), ["r1"])  # type: ignore[arg-type]
+    budget = NewsBudget(store, NewsSettings(llm_daily_usd=0.0, llm_monthly_usd=0.0), None, "r1", lambda: NOW)
+    llm = NewsLlm(inner, budget, ["r1"])  # type: ignore[arg-type]
     res = await asyncio.gather(*(llm.structured(dataclasses.replace(spec), TopicLabels) for _ in range(3)), return_exceptions=True)
-    assert sum(1 for r in res if not isinstance(r, BaseException)) == 1 and inner.calls == 1
-    assert all(isinstance(r, BudgetExceeded) for r in res if isinstance(r, BaseException))
+    assert not [r for r in res if isinstance(r, BaseException)] and inner.calls == 3
     actual = Usage(spec.model, input_tokens=100, output_tokens=10).cost_usd()
-    assert store.runs["r1"]["cost_usd"] == pytest.approx(actual)  # reservations released, actual cost booked
+    assert store.runs["r1"]["cost_usd"] == pytest.approx(3 * actual)
+    st = await budget.status()
+    assert st["global"]["caps"]["llm_day"] is None and st["global"]["caps"]["llm_month"] is None
+    assert not [k for k in await budget.ratios() if "llm" in k] and "global_image_day" in await budget.ratios()  # image caps stay
 
 
 async def test_reservation_is_released_when_the_call_fails() -> None:
