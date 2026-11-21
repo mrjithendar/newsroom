@@ -23,8 +23,8 @@ Shared PostgreSQL: news_* tables (moks-cms migrations), seo_flow_runs + run hist
 | `app/` | The service: internal API on port 8080 (`app/main.py`), the news flows (`app/flows/news.py`), the news desk (`app/news/`), the crew plumbing (`app/crews/`) |
 | `app/seo_agent.py` | The two things it asks the seo-agent for: site search and the one LLM budget |
 | `tests/` | pytest; `tests/moks_cms.py` finds the moks-cms checkout for the contract tests |
-| `scripts/` | The database role (`db-role.sql`), CI helpers |
-| `docs/` | Architecture, ML, quality gates, images, costs, Prometheus alerts. The admin's docs (jobs, sources, set-up, runbook) are in moks-cms `docs/news/` |
+| `scripts/` | The database role (`db-role.sql`), the embeddings cutoff calibration (`calibrate_embeddings.py`), CI helpers |
+| `docs/` | Architecture, ML, quality gates, images, costs. The admin's docs (jobs, sources, set-up, runbook) and the alert rules (`prometheus-alerts.yml`, `job="news-agent"`) are in moks-cms `docs/news/` |
 | `Dockerfile` | The image: locked dependencies and the bge-small-en-v1.5 ONNX model (checksums verified in the build) |
 
 The core (`app/llm.py`, `runs.py`, `run_history.py`, `schedules.py`, `crews/`, `flows/base.py`, …) is a fork of the

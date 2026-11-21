@@ -32,7 +32,7 @@ def routes() -> list[tuple[str, re.Pattern[str]]]:
 
 def news_routes() -> list[tuple[str, re.Pattern[str]]]:
     src = www(SERVER).read_text()
-    start = src.index("NEWS_AGENT_ROUTES")
+    start = src.index("export const NEWS_AGENT_ROUTES")
     block = src[start : src.index("];", start)]
     out = _parse(block)
     assert out, "could not parse NEWS_AGENT_ROUTES"

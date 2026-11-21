@@ -123,3 +123,21 @@ async def test_postgres_scoping() -> None:
                 await pool.close()
         finally:
             await admin.execute(f"drop database if exists {database} with (force)")
+
+
+def test_the_default_news_schedules_are_flows_this_dispatcher_starts() -> None:
+    """moks-cms migration 0037 seeds news-dispatch, news-train and news-style-review: each must be a flow this service
+    schedules, with inputs the flow accepts and a cron the evaluator reads. The other twelve rows are the seo-agent's."""
+    import json
+    import re
+
+    from app.news.cron import Cron
+    from tests.moks_cms import www
+
+    sql = www("src/db/migrations/0037_crewai_schedules_crews.sql").read_text()
+    rows = re.findall(r"\('([a-z0-9-]+)', '([a-z0-9_]+_flow)', '(?:[^']|'')*', '([^']+)', '(\{[^']*\})'\)", sql)
+    mine = [r for r in rows if r[1] in SPECS]
+    assert {flow for _, flow, _, _ in mine} == CRON_FLOWS and len(mine) == 3
+    for _name, flow, cron, inputs in mine:
+        Cron(cron, "Etc/UTC")
+        SPECS[flow].input_model.model_validate(json.loads(inputs))
