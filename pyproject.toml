@@ -11,7 +11,7 @@ dependencies = [
   # Official SDK, pinned directly (D-54): Claude through the Anthropic SDK behind CrewAI's BaseLLM. No MCP server and
   # no report PDFs here (the seo-agent's), so neither `mcp` (still installed: crewai needs it) nor reportlab is pinned.
   "anthropic==2.6.0",
-  "fastapi==0.162.0",
+  "fastapi==0.162.1",
   "uvicorn==0.54.0",
   "psycopg[binary]==3.3.8",
   "psycopg-pool==3.3.3",
