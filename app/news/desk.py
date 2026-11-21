@@ -226,7 +226,15 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
     now = d.clock()
     recent = await d.store.recent_items(now - timedelta(days=window_days))
     by_id = {str(i["id"]): i for i in recent}
-    fresh = [by_id[i] for i in new_ids if i in by_id]
+    # Every stored item gets a cluster in this step, so one without a cluster was left by a run that failed here. It is
+    # not new any more (its feed sends it again, the insert skips it), so take it now, oldest first, or it never
+    # becomes a story.
+    new = set(new_ids)
+    leftover = [str(i["id"]) for i in recent if not i.get("cluster_id") and str(i["id"]) not in new]
+    if leftover:
+        rec.count("dedupe_leftovers", len(leftover))
+    fresh = [by_id[i] for i in [*leftover, *new_ids] if i in by_id]
+    fresh_ids = {str(i["id"]) for i in fresh}
     if fresh:
         vecs = []
         for k in range(0, len(fresh), 32):
@@ -234,7 +242,7 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
         for i, v in zip(fresh, vecs, strict=True):
             i["embedding"] = [float(x) for x in v]
             await d.store.update_item(str(i["id"]), embedding=i["embedding"])
-    old = [i for i in recent if str(i["id"]) not in set(new_ids)]
+    old = [i for i in recent if str(i["id"]) not in fresh_ids]
     # After a model change the window's vectors must become comparable with the fresh ones (REEMBED_PER_RUN per run).
     # Those still waiting are compared by text only in this run: their old vectors are dropped here, not in the table.
     await _reembed(d, old)
@@ -266,6 +274,7 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
             cve_counts=Counter({str(k): int(v) for k, v in ((em or {}).get("cve_counts") or {}).items()}),
         )
     touched: set[str] = set()
+    links: list[tuple[str, str]] = []
     for i in fresh:
         sig = _sig(i, None)
         res = dd.check(sig)
@@ -284,13 +293,17 @@ async def dedupe_and_cluster(d: DeskDeps, rec: RunRecorder, new_ids: list[str], 
         cid, created = cl.assign(item_id=sig.id, title=i["title"], embedding=i.get("embedding"), entities=es, cves=cves, source_id=sig.source_id or "", at=at, severity=meta.get("cvss"), exploited=bool(meta.get("kev")), force_cluster=force)
         if created:
             rec.count("clusters_new")
-        await d.store.update_item(sig.id, cluster_id=cid)
+        links.append((sig.id, cid))
         i["cluster_id"] = cid
         dd.add(sig)
         touched.add(cid)
+    # Clusters first, then the items that point at them: news_items.cluster_id references news_clusters (moks-cms
+    # src/db/migrations/0017_news_desk.sql, checked per statement), and a cluster made in this run has no row yet.
     for cid in touched:
         state = cl.clusters[cid]
         await d.store.save_cluster(_cluster_row(state, now, existing=await d.store.get_cluster(cid)))
+    for item_id, cid in links:
+        await d.store.update_item(item_id, cluster_id=cid)
     rec.count("clustered", len(touched))
     return sorted(touched)
 
