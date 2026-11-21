@@ -23,6 +23,7 @@ Every endpoint except /healthz, /readyz and /metrics needs `Authorization: Beare
     PUT  /llm-budgets                   409: replaced by /llm-budget
     GET  /llm-providers                 provider kinds, saved providers and their models; a key is never returned
     PUT  /llm-providers                 one provider (+ its models), validated, all or nothing (app/llm_providers)
+    POST /llm-providers/{id}/discover   "Fetch models": the provider's own model list; nothing is saved or switched on
     GET  /llm-models                    models that are switched on, of providers that are on (for pickers)
     GET  /admin-settings                settings an admin may change: schema, effective values, source, restart pending
     PUT  /admin-settings/{group}        {values, actor} → one group, validated, all or nothing (app/admin_settings)
@@ -78,6 +79,8 @@ from .llm_budgets import overview as llm_overview
 from .llm_providers import Invalid as ProviderInvalid
 from .llm_providers import MemoryProviderStore, PgProviderStore, ProviderIn, check_catalog, enabled_models, save_provider
 from .llm_providers import overview as providers_overview
+from .llm_providers.discover import CannotDiscover
+from .llm_providers.discover import discover as discover_models
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
 from .run_history import MemoryHistorySink, PgHistorySink, RecordingLlm, RunHistory
@@ -675,6 +678,15 @@ def create_app(container: Container | None = None) -> FastAPI:
             return JSONResponse({"error": "the provider is not valid", "issues": e.issues[:30]}, status_code=422)
         log.info("llm provider saved", extra={"event": "llm_provider_saved", "provider": changed["id"], "enabled": changed["enabled"], "key_changed": changed["key_changed"], "models": changed["models"]})
         return {"saved": changed, **(await providers_overview(c.providers))}
+
+    @app.post("/llm-providers/{provider_id}/discover", dependencies=[Depends(auth)])
+    async def discover_llm_models(provider_id: str, request: Request) -> Any:
+        try:
+            return await discover_models(ctr(request).providers, provider_id)
+        except LookupError:
+            return JSONResponse({"error": "no such provider"}, status_code=404)
+        except CannotDiscover as e:
+            return JSONResponse({"error": str(e)}, status_code=e.status)
 
     @app.get("/llm-models", dependencies=[Depends(auth)])
     async def llm_models(request: Request) -> dict[str, Any]:
