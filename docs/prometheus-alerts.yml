@@ -1,0 +1,59 @@
+# News desk alerts, in the format of the miniKube repository's deploy/minikube/observability/prometheus/files/alerts.yml.
+# NOT applied from this repository (like docs/seo/prometheus-alerts.yml, decision D-12): a person adds this group there.
+# The gauges are computed from the database every minute (news-agent app/main.py _news_gauges), so they survive restarts.
+# Labels: `news_job` is the news job id (≤ 25 jobs, enforced by the web app); everything else is a fixed set.
+groups:
+  - name: jithendar-com-news
+    rules:
+      # A job's last two runs both failed.
+      - alert: NewsJobFailingRepeatedly
+        expr: max by (news_job) (news_job_consecutive_failures{job="news-agent"}) >= 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'News job {{ $labels.news_job }} failed twice in a row'
+          runbook_url: 'https://github.com/mrjithendar/moks-cms/blob/master/docs/news/RUNBOOK.md#job-failing'
+      # An enabled source has not fetched successfully for 24 hours.
+      - alert: NewsSourceFailing24h
+        expr: max(news_source_failing_seconds{job="news-agent"}) > 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'A news source has been failing for more than 24 hours'
+          runbook_url: 'https://github.com/mrjithendar/moks-cms/blob/master/docs/news/RUNBOOK.md#source-failing'
+      # More than 50 % of drafts failed the quality gates over 7 days (prompt, profile or source problem).
+      - alert: NewsQualityFailureRateHigh
+        expr: max(news_quality_failure_ratio_7d{job="news-agent"}) > 0.5
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Over half of news drafts failed the quality gates in the last 7 days'
+          runbook_url: 'https://github.com/mrjithendar/moks-cms/blob/master/docs/news/RUNBOOK.md#quality-failures'
+      - alert: NewsBudget80Percent
+        expr: max by (scope) (news_budget_used_ratio{job="news-agent"}) >= 0.8 and max by (scope) (news_budget_used_ratio{job="news-agent"}) < 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: 'News budget {{ $labels.scope }} at {{ $value | humanizePercentage }}'
+          runbook_url: 'https://github.com/mrjithendar/moks-cms/blob/master/docs/news/RUNBOOK.md#budget'
+      - alert: NewsBudgetReached
+        expr: max by (scope) (news_budget_used_ratio{job="news-agent"}) >= 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'News budget {{ $labels.scope }} reached: runs pause until the period resets or the cap is raised'
+          runbook_url: 'https://github.com/mrjithendar/moks-cms/blob/master/docs/news/RUNBOOK.md#budget'
+      # An enabled job produced no draft for review in 3 days (N = 3; change here).
+      - alert: NewsJobNoDrafts
+        expr: (time() - max by (news_job) (news_job_last_draft_timestamp_seconds{job="news-agent"})) > 3 * 86400 and max by (news_job) (news_job_last_draft_timestamp_seconds{job="news-agent"}) > 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: 'News job {{ $labels.news_job }} has produced no draft for review in 3 days'
+          runbook_url: 'https://github.com/mrjithendar/moks-cms/blob/master/docs/news/RUNBOOK.md#no-drafts'

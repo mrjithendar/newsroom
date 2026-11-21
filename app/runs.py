@@ -1,5 +1,7 @@
 """Flow runs: the `seo_flow_runs` table, CrewAI's Postgres persistence, advisory locks, and the run manager.
 
+Forked from moks-seo-agent/app/runs.py@bb9e553 on 2026-11-21.
+
 - `seo_flow_runs` (web migration 0016) is the single record of every flow run: status (queued | running | succeeded
   | failed | cancelled | paused_budget), current step, the typed state CrewAI persists after each step, outputs,
   error, tokens, cost, trigger and correlation id. The admin UI, the MCP `list_flow_runs` tool and the alerts read it.
@@ -12,6 +14,10 @@
 - A run that dies mid-way is not resumed: on start-up, `running`/`queued` rows left by the previous process are
   marked failed ("interrupted by a restart"). A rerun starts from the beginning; every step is idempotent (upserts,
   one open draft per article, the approval is single-use).
+- Two services write this table: the seo-agent and the news agent (moks-seo-agent, mrjithendar/newsroom). Each store
+  is given the flow names its service runs (`flows`, = the keys of app/flows SPECS) and reads, counts, recovers and
+  cancels only those rows, so a restart of one never fails the other's runs and neither lists or cancels the other's.
+  `flows=None` (tests only) means every row.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 from . import metrics, tracing
 
-log = logging.getLogger("seo_agent.runs")
+log = logging.getLogger("news_agent.runs")
 
 ACTIVE = ("queued", "running")
 TERMINAL = ("succeeded", "failed", "cancelled", "paused_budget")
@@ -80,8 +86,13 @@ class RunStore(Protocol):
 
 
 class PgRunStore:
-    def __init__(self, pool: Any):
+    def __init__(self, pool: Any, flows: frozenset[str] | None = None):
         self.pool = pool
+        self.flows = sorted(flows) if flows is not None else None  # the flows this service owns; None = all rows
+
+    def _own(self) -> tuple[str, list[Any]]:
+        """SQL condition and its argument: only this service's flows."""
+        return ("true", []) if self.flows is None else ("flow_name = any(%s)", [self.flows])
 
     async def create(self, row: dict[str, Any]) -> dict[str, Any]:
         f = {k: row[k] for k in _COLS if k in row}
@@ -118,14 +129,18 @@ class PgRunStore:
             await c.execute(f"update seo_flow_runs set {sets}, updated_at = now() where run_id = %(run_id)s", {"run_id": run_id, **f})  # noqa: S608
 
     async def get(self, run_id: str) -> dict[str, Any] | None:
+        own, args = self._own()
         async with self.pool.connection() as c:
-            cur = await c.execute("select * from seo_flow_runs where run_id::text = %s", (run_id,))
+            cur = await c.execute(f"select * from seo_flow_runs where run_id::text = %s and {own}", (run_id, *args))  # noqa: S608 - constant condition
             r = await cur.fetchone()
             return dict(r) if r else None
 
     async def list_runs(self, *, flow: str | None = None, status: str | None = None, draft_id: str | None = None, limit: int = 20, before: str | None = None) -> list[dict[str, Any]]:
-        where: list[str] = ["true"]
-        args: list[Any] = []
+        own, own_args = self._own()
+        if flow and self.flows is not None and flow not in self.flows:
+            return []
+        where: list[str] = [own]
+        args: list[Any] = [*own_args]
         for col, val in (("flow_name", flow), ("status", status), ("draft_id::text", draft_id)):
             if val:
                 where.append(f"{col} = %s")
@@ -139,27 +154,36 @@ class PgRunStore:
             return [dict(r) for r in await cur.fetchall()]
 
     async def count_status(self, status: str) -> int:
+        own, args = self._own()
         async with self.pool.connection() as c:
-            cur = await c.execute("select count(*)::int as n from seo_flow_runs where status = %s", (status,))
+            cur = await c.execute(f"select count(*)::int as n from seo_flow_runs where status = %s and {own}", (status, *args))  # noqa: S608 - constant condition
             return int((await cur.fetchone())["n"])
 
     async def sweep_orphans(self) -> list[dict[str, Any]]:
+        """Only this service's runs: the other service's queued/running rows are its own, and alive."""
+        own, args = self._own()
         async with self.pool.connection() as c:
             cur = await c.execute(
-                """update seo_flow_runs set status = 'failed', error = 'interrupted by a restart; rerun to start again',
-                     finished_at = now(), updated_at = now() where status in ('queued', 'running') returning *"""
+                f"""update seo_flow_runs set status = 'failed', error = 'interrupted by a restart; rerun to start again',
+                     finished_at = now(), updated_at = now() where status in ('queued', 'running') and {own} returning *""",  # noqa: S608 - constant condition
+                args,
             )
             return [dict(r) for r in await cur.fetchall()]
 
     async def recent_kickoffs(self, actor: str, since_s: int) -> int:
+        own, args = self._own()
         async with self.pool.connection() as c:
-            cur = await c.execute("select count(*)::int as n from seo_flow_runs where actor = %s and started_at > now() - make_interval(secs => %s)", (actor, since_s))
+            cur = await c.execute(f"select count(*)::int as n from seo_flow_runs where actor = %s and started_at > now() - make_interval(secs => %s) and {own}", (actor, since_s, *args))  # noqa: S608 - constant condition
             return int((await cur.fetchone())["n"])
 
 
 @dataclass
 class MemoryRunStore:
     rows: dict[str, dict[str, Any]] = field(default_factory=dict)
+    flows: frozenset[str] | None = None  # the flows this service owns; None = all rows (as PgRunStore)
+
+    def _own(self, r: dict[str, Any]) -> bool:
+        return self.flows is None or r.get("flow_name") in self.flows
 
     async def create(self, row: dict[str, Any]) -> dict[str, Any]:
         for r in self.rows.values():
@@ -177,29 +201,30 @@ class MemoryRunStore:
             self.rows[run_id]["updated_at"] = datetime.now(UTC)
 
     async def get(self, run_id: str) -> dict[str, Any] | None:
-        return self.rows.get(run_id)
+        r = self.rows.get(run_id)
+        return r if r is not None and self._own(r) else None
 
     async def list_runs(self, *, flow: str | None = None, status: str | None = None, draft_id: str | None = None, limit: int = 20, before: str | None = None) -> list[dict[str, Any]]:
-        out = [r for r in self.rows.values() if (not flow or r["flow_name"] == flow) and (not status or r["status"] == status) and (not draft_id or r.get("draft_id") == draft_id)]
+        out = [r for r in self.rows.values() if self._own(r) and (not flow or r["flow_name"] == flow) and (not status or r["status"] == status) and (not draft_id or r.get("draft_id") == draft_id)]
         out.sort(key=lambda r: r["started_at"], reverse=True)
         if before:
             out = [r for r in out if r["started_at"].isoformat() < before]
         return out[: max(1, min(limit, 50))]
 
     async def count_status(self, status: str) -> int:
-        return sum(1 for r in self.rows.values() if r["status"] == status)
+        return sum(1 for r in self.rows.values() if r["status"] == status and self._own(r))
 
     async def sweep_orphans(self) -> list[dict[str, Any]]:
         out = []
         for r in self.rows.values():
-            if r["status"] in ACTIVE:
+            if r["status"] in ACTIVE and self._own(r):
                 r.update(status="failed", error="interrupted by a restart; rerun to start again")
                 out.append(r)
         return out
 
     async def recent_kickoffs(self, actor: str, since_s: int) -> int:
         cutoff = datetime.now(UTC).timestamp() - since_s
-        return sum(1 for r in self.rows.values() if r.get("actor") == actor and r["started_at"].timestamp() > cutoff)
+        return sum(1 for r in self.rows.values() if r.get("actor") == actor and r["started_at"].timestamp() > cutoff and self._own(r))
 
 
 # --- CrewAI persistence -------------------------------------------------------------------------------------------

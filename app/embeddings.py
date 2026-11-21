@@ -1,5 +1,7 @@
 """Embeddings providers and the heading-aware chunker.
 
+Forked from moks-seo-agent/app/embeddings.py@bb9e553 on 2026-11-21.
+
 EMBEDDINGS_PROVIDER:
 - onnx (default): BAAI/bge-small-en-v1.5 exported to ONNX (384 dimensions), run with ONNX Runtime on CPU. No torch.
   The model files are baked into the image at build time (Dockerfile, pinned revision + checksums).

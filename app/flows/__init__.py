@@ -1,12 +1,13 @@
-"""The flow catalogue (docs/seo/FLOWS.md) and who may start what.
+"""The news agent's flow catalogue (docs/ARCHITECTURE.md) and who may start what.
 
-- `SPECS`: every flow, its strict input model, and its lock target (one active run per flow + target).
-- `publish_flow` is started only by a human approval (`triggered_by="approval"`, set solely by the review decision
-  endpoint). The runner refuses it for every other trigger: the generic kickoff API, CronJobs, child runs of other
-  flows and MCP (`check_kickoff`).
-- `MCP_KICKOFF_ALLOWLIST`: what the admin MCP `kickoff_flow` tool may start. Never publish_flow.
+- `SPECS`: every flow this service runs, its strict input model, and its lock target (one active run per flow +
+  target). These names are also what this service owns in the shared `seo_flow_runs` and `seo_flow_schedules` tables:
+  it recovers, lists, cancels and dispatches only these (app/runs.py, app/schedules.py). The seo-agent does the same
+  with its own names, so the two never touch each other's rows.
+- No flow here can publish: publishing a news article is the seo-agent's `publish_flow`, started only by a human
+  approval in the web app's review queue. `approval` and `mcp` triggers are refused for every flow (`check_kickoff`).
 - `CRON_FLOWS`: what a schedule may start (app/schedules.py, the CrewAI console's Schedules).
-- `crew_test_flow`: the console's Test run of a crew configuration (app/flows/crew_test.py); started by an admin only.
+- `crew_test_flow`: the console's Test run of the news crew's configuration (app/flows/crew_test.py); an admin only.
 """
 
 from __future__ import annotations
@@ -14,24 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..runs import FlowSpec, RunError
-from ..state import (
-    JobInput,
-    LinkingInput,
-    MlInput,
-    NewArticleInput,
-    NoInput,
-    OptimizeInput,
-    PromotionInput,
-    PublishInput,
-    ReindexInput,
-    ReportInput,
-    WeeklyInput,
-)
 from .crew_test import CrewTestFlow, CrewTestInput
-from .jobs import Ga4SyncFlow, GscSyncFlow, TechAuditFlow
-from .maintenance import AskGapsFlow, InternalLinkingFlow, ReindexFlow
-from .ml import SeoMlFlow
-from .new_article import NewArticleFlow
 from .news import (
     NEWS_INPUTS,
     NewsDispatchFlow,
@@ -43,43 +27,16 @@ from .news import (
     NewsStyleReviewFlow,
     NewsTrainFlow,
 )
-from .optimize_article import OptimizeArticleFlow
-from .promotion import ContentIdeasFlow, PromotionFlow
-from .publish import PublishFlow
-from .report import ReportFlow
-from .weekly import WeeklyRecommendationsFlow
+
+AGENT = "news"  # GET /flows and GET /crews tag every entry with it: moks-cms merges the two agents' catalogues
 
 
 def _site(_i: dict[str, Any]) -> str:
     return "site"
 
 
-def _draft(i: dict[str, Any]) -> str:
-    return str(i["draft_id"])
-
-
-def _draft_of(i: dict[str, Any]) -> str | None:
-    return str(i["draft_id"]) if i.get("draft_id") else None
-
-
 SPECS: dict[str, FlowSpec] = {
-    "gsc_sync_flow": FlowSpec("gsc_sync_flow", GscSyncFlow.create, JobInput, _site),
-    "ga4_sync_flow": FlowSpec("ga4_sync_flow", Ga4SyncFlow.create, JobInput, _site),
-    "tech_audit_flow": FlowSpec("tech_audit_flow", TechAuditFlow.create, JobInput, _site),
-    "weekly_recommendations_flow": FlowSpec("weekly_recommendations_flow", WeeklyRecommendationsFlow.create, WeeklyInput, _site),
-    "optimize_article_flow": FlowSpec("optimize_article_flow", OptimizeArticleFlow.create, OptimizeInput, _draft, _draft_of),
-    "internal_linking_flow": FlowSpec("internal_linking_flow", InternalLinkingFlow.create, LinkingInput, _site),
-    "new_article_flow": FlowSpec("new_article_flow", NewArticleFlow.create, NewArticleInput, _draft, _draft_of),
-    "publish_flow": FlowSpec("publish_flow", PublishFlow.create, PublishInput, _draft, _draft_of),
-    "reindex_flow": FlowSpec("reindex_flow", ReindexFlow.create, ReindexInput, _site),
-    "ask_gaps_flow": FlowSpec("ask_gaps_flow", AskGapsFlow.create, NoInput, _site),
-    "report_flow": FlowSpec("report_flow", ReportFlow.create, ReportInput, lambda i: str(i.get("period", "weekly"))),
-    # v5 SEO-side ML (docs/seo/ML.md): one run at a time, site-wide.
-    "seo_ml_flow": FlowSpec("seo_ml_flow", SeoMlFlow.create, MlInput, _site),
-    # Promotion (docs/seo/PROMOTION.md): one run per article (or one site-wide run); ideas are site-wide.
-    "promotion_flow": FlowSpec("promotion_flow", PromotionFlow.create, PromotionInput, lambda i: str(i.get("article_id") or "site")),
-    "content_ideas_flow": FlowSpec("content_ideas_flow", ContentIdeasFlow.create, NoInput, _site),
-    # News desk (docs/news/ARCHITECTURE.md). Lock targets: one active run per job; one per job + story for drafts.
+    # Lock targets: one active run per job; one per job + story for drafts.
     "news_dispatch_flow": FlowSpec("news_dispatch_flow", NewsDispatchFlow.create, NEWS_INPUTS["news_dispatch_flow"], _site),
     "news_job_flow": FlowSpec("news_job_flow", NewsJobFlow.create, NEWS_INPUTS["news_job_flow"], lambda i: f"job:{i['job_id']}"),
     "news_draft_flow": FlowSpec("news_draft_flow", NewsDraftFlow.create, NEWS_INPUTS["news_draft_flow"], lambda i: f"{i['job_id']}:{i['cluster_ids'][0]}:{i.get('mode', 'single')}"),
@@ -88,28 +45,22 @@ SPECS: dict[str, FlowSpec] = {
     "news_train_flow": FlowSpec("news_train_flow", NewsTrainFlow.create, NEWS_INPUTS["news_train_flow"], _site),
     "news_style_review_flow": FlowSpec("news_style_review_flow", NewsStyleReviewFlow.create, NEWS_INPUTS["news_style_review_flow"], _site),
     "news_playground_flow": FlowSpec("news_playground_flow", NewsPlaygroundFlow.create, NEWS_INPUTS["news_playground_flow"], lambda i: f"{i['job_id']}:{i['cluster_id']}"),
-    # CrewAI console (D-98): a crew configuration's test run on an earlier run's inputs. One at a time per crew.
+    # CrewAI console (D-98): the news crew's configuration test run on an earlier run's inputs. One at a time.
     "crew_test_flow": FlowSpec("crew_test_flow", CrewTestFlow.create, CrewTestInput, lambda i: f"crew:{i['crew']}"),
 }
 NEWS_FLOWS = frozenset(n for n in SPECS if n.startswith("news_"))
+OWNED_FLOWS = frozenset(SPECS)
 
-APPROVAL_ONLY = frozenset({"publish_flow"})
-DRAFTING_FLOWS = ("optimize_article_flow", "new_article_flow")
-MCP_KICKOFF_ALLOWLIST = frozenset({"news_job_flow", "optimize_article_flow", "new_article_flow", "internal_linking_flow", "tech_audit_flow", "report_flow", "gsc_sync_flow", "ga4_sync_flow"})
-CRON_FLOWS = frozenset({"news_dispatch_flow", "news_train_flow", "news_style_review_flow", "gsc_sync_flow", "ga4_sync_flow", "tech_audit_flow", "weekly_recommendations_flow", "internal_linking_flow", "reindex_flow", "ask_gaps_flow", "report_flow", "seo_ml_flow", "promotion_flow", "content_ideas_flow"})
-
-
-MANUAL_ONLY = frozenset({"crew_test_flow"})  # started by a person in the console: never by a schedule, a flow or MCP
+CRON_FLOWS = frozenset({"news_dispatch_flow", "news_train_flow", "news_style_review_flow"})
+MANUAL_ONLY = frozenset({"crew_test_flow"})  # started by a person in the console: never by a schedule or a flow
 
 
 def check_kickoff(name: str, triggered_by: str) -> None:
     if name not in SPECS:
         raise RunError(404, f"unknown flow {name}")
-    if name in APPROVAL_ONLY and triggered_by != "approval":
-        raise RunError(403, f"{name} starts only from a human approval in the review UI")
-    if triggered_by == "approval" and name not in APPROVAL_ONLY:
-        raise RunError(400, "only publish_flow is started by an approval")
-    if triggered_by == "mcp" and name not in MCP_KICKOFF_ALLOWLIST:
+    if triggered_by == "approval":
+        raise RunError(400, "no news flow is started by an approval (publishing is the seo-agent's publish_flow)")
+    if triggered_by == "mcp":
         raise RunError(403, f"{name} cannot be started from MCP")
     if name in MANUAL_ONLY and triggered_by != "manual":
         raise RunError(403, f"{name} starts only from the CrewAI console")
@@ -119,7 +70,7 @@ def check_kickoff(name: str, triggered_by: str) -> None:
 
 def catalogue() -> list[dict[str, Any]]:
     """GET /flows: every flow with its input model as JSON Schema (the console's Run with parameters form), whether a
-    schedule may start it, and which crews it runs (a crew's test run replays these flows' runs)."""
+    schedule may start it, which crews it runs (a crew's test run replays these flows' runs) and the owning agent."""
     from ..crews.config import registry
 
     crews: dict[str, list[str]] = {}
@@ -129,10 +80,11 @@ def catalogue() -> list[dict[str, Any]]:
     return [
         {
             "name": name,
+            "agent": AGENT,
             "inputs_schema": spec.input_model.model_json_schema(),
-            "approval_only": name in APPROVAL_ONLY,
+            "approval_only": False,
             "schedulable": name in CRON_FLOWS,
-            "mcp": name in MCP_KICKOFF_ALLOWLIST,
+            "mcp": False,
             "crews": crews.get(name, []),
         }
         for name, spec in SPECS.items()

@@ -1,6 +1,6 @@
 """PgNewsStore against a real PostgreSQL using the web app's actual migration 0017 (not a copy): unique constraints
 (item per source, slot per job, one active draft per story per job, one active model), counts, spend, retention, and
-the rollback script. Needs SEO_AGENT_TEST_DATABASE_URL (or testcontainers); skipped otherwise. No pgvector needed."""
+the rollback script. Needs NEWS_AGENT_TEST_DATABASE_URL (or testcontainers); skipped otherwise. No pgvector needed."""
 
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ def statements(path: Path) -> list[str]:
 
 @pytest.fixture
 async def store() -> AsyncIterator[PgNewsStore]:
-    url = os.environ.get("SEO_AGENT_TEST_DATABASE_URL")
+    url = os.environ.get("NEWS_AGENT_TEST_DATABASE_URL")
     if not url:
-        pytest.skip("set SEO_AGENT_TEST_DATABASE_URL to run the news Postgres tests")
+        pytest.skip("set NEWS_AGENT_TEST_DATABASE_URL to run the news Postgres tests")
     import psycopg
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool

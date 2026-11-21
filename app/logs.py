@@ -1,5 +1,7 @@
 """Process logging: one JSON object per line on stderr.
 
+Forked from moks-seo-agent/app/logs.py@bb9e553 on 2026-11-21.
+
 The format string this replaces only looked like JSON: a quote or a newline in a message broke the line, tracebacks
 were printed as extra plain-text lines, and the fields passed with `extra=` (event, tool, ref, …) were dropped, so the
 reference an MCP client is shown for a failed tool call could not be found in the logs.

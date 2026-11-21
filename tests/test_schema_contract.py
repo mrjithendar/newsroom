@@ -5,7 +5,7 @@ in moks-cms that renames, drops or retypes one of those columns would leave thes
 fails in production. Here every migration is applied to a scratch database, each hand-written `create table` found in
 the test sources is created beside it, and each of its columns has to exist in the real table with the same type.
 
-Needs SEO_AGENT_TEST_DATABASE_URL (the CI service container); skipped without it.
+Needs NEWS_AGENT_TEST_DATABASE_URL (the CI service container); skipped without it.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ import pytest
 from tests.moks_cms import www
 
 TESTS = Path(__file__).resolve().parent
-# Created by the agent itself (app/index.py: the vector width follows the embedding model), not by a migration.
-AGENT_OWNED = {"seo_article_chunks"}
+# Tables the agent creates itself, not a migration: none (the news agent owns no table).
+AGENT_OWNED: set[str] = set()
 
 
 def hand_written_tables() -> list[tuple[str, str, str]]:
@@ -55,15 +55,15 @@ async def columns(c: Any, schema: str, table: str) -> dict[str, str]:
 
 def test_the_hand_written_tables_are_found() -> None:
     names = {table for _, table, _ in hand_written_tables()}
-    assert {"post", "seo_flow_runs", "seo_llm_usage", "setting"} <= names
+    assert {"seo_flow_runs"} <= names
     assert all(stmt.endswith(")") and stmt.count("(") == stmt.count(")") for _, _, stmt in hand_written_tables())
 
 
 @pytest.mark.postgres
 async def test_hand_written_tables_match_the_web_app_migrations() -> None:
-    url = os.environ.get("SEO_AGENT_TEST_DATABASE_URL")
+    url = os.environ.get("NEWS_AGENT_TEST_DATABASE_URL")
     if not url:
-        pytest.skip("set SEO_AGENT_TEST_DATABASE_URL to check the test tables against the web app's migrations")
+        pytest.skip("set NEWS_AGENT_TEST_DATABASE_URL to check the test tables against the web app's migrations")
     import psycopg
     from psycopg.conninfo import make_conninfo
 

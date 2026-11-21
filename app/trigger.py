@@ -1,11 +1,13 @@
 """CronJob entrypoint: start what is due, or one flow, then let the Istio sidecar exit. No business logic lives here.
 
-  python -m app.trigger dispatch                          the one CronJob (every minute): POST /schedules/dispatch
-  python -m app.trigger gsc_sync_flow                     one flow now (kept for a manual Job or an old CronJob)
-  python -m app.trigger report_flow '{"period": "monthly"}'
+Forked from moks-seo-agent/app/trigger.py@bb9e553 on 2026-11-21.
 
-`dispatch` asks the running seo-agent to start every schedule in the database that is due (app/schedules.py; the
-schedules are edited in the CrewAI console). A flow name calls `POST /flows/{name}/kickoff` with the service token and
+  python -m app.trigger dispatch                          the news agent's CronJob (every minute): POST /schedules/dispatch
+  python -m app.trigger news_train_flow                   one flow now (a manual Job)
+  python -m app.trigger news_style_review_flow '{"days": 14}'
+
+`dispatch` asks the running news agent to start every news schedule in the database that is due (app/schedules.py;
+the schedules are edited in the CrewAI console). A flow name calls `POST /flows/{name}/kickoff` with the service token and
 `triggered_by=cron`; a 200 "existing" answer (the previous run is still going) counts as success. Flows run in the
 service (one place holds the model, the locks and the run records). In the mesh a Job's sidecar would keep the pod
 alive after the container exits, so the trigger calls /quitquitquit at the end (harmless without a sidecar).
@@ -35,8 +37,8 @@ def main(argv: list[str]) -> int:
     except ValueError:
         print(json.dumps({"event": "trigger", "flow": name, "error": "inputs are not JSON"}))
         return 2
-    url = os.environ.get("SEO_AGENT_URL", "http://seo-agent.jithendar:8080").rstrip("/")
-    token = os.environ.get("SEO_AGENT_TOKEN", "")
+    url = os.environ.get("NEWS_AGENT_URL", "http://news-agent.jithendar:8080").rstrip("/")
+    token = os.environ.get("NEWS_AGENT_TOKEN", "")
     code = 0
     try:
         headers = {"Authorization": f"Bearer {token}"}

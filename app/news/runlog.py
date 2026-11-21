@@ -18,7 +18,7 @@ from typing import Any
 
 from .store import NewsStore
 
-log = logging.getLogger("seo_agent.news")
+log = logging.getLogger("news_agent.news")
 STEPS = ("fetch", "normalize", "dedupe", "cluster", "classify", "score", "select", "draft", "quality", "image", "save", "notify")
 LEVELS = ("debug", "info", "warning", "error")
 

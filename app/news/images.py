@@ -5,7 +5,7 @@ Providers (NEWS_IMAGE_PROVIDER / the image profile; none but `template` works wi
   illustration per topic and the headline. Pillow, no network. Always available as the fallback.
 - gemini: the web app's existing Gemini image integration (Admin → Integrations, its own key and limits) through the
   callback API; the agent never holds that key.
-- openai: the OpenAI Images API called from the agent (needs OPENAI_API_KEY in the seo-agent Secret and an egress rule).
+- openai: the OpenAI Images API called from the agent (needs OPENAI_API_KEY in the news-agent Secret and an egress rule).
 Local Stable Diffusion is not offered: on CPU-only Minikube one 1024² image takes minutes and several GiB of RAM.
 
 Pipeline: brief → N variants → vision safety check (no faces, logos/trademarks, text gibberish) → best match to the
@@ -177,7 +177,7 @@ class OpenAIProvider:
 
     def __init__(self, api_key: str, model: str, price_usd: float, client: Any = None):
         if not api_key:
-            raise ImageError("OPENAI_API_KEY is not set for the seo-agent")
+            raise ImageError("OPENAI_API_KEY is not set for the news agent")
         self.key, self.model, self.price, self.client = api_key, model, price_usd, client
 
     async def generate(self, brief: Brief, prompt: str, negative: str, n: int) -> list[Generated]:

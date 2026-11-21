@@ -11,10 +11,10 @@ from typing import Any
 import pytest
 
 from app import run_history as rh
-from app.llm import CallSpec, Truncated, Usage
+from app.llm import BudgetGuard, CallSpec, FakeLlm, MemorySpendStore, Truncated, Usage
 from app.main import memory_container
 from app.run_history import MemoryHistorySink, RecordingLlm, RunHistory, install, uninstall
-from tests.conftest import FakeWebApp, settings
+from tests.conftest import settings
 
 RUN = str(uuid.uuid4())
 
@@ -42,39 +42,43 @@ async def kickoff(c: Any, name: str, inputs: dict[str, Any] | None = None) -> di
     return await c.runner.wait(r["run_id"], 30)
 
 
-async def test_a_flow_run_records_its_steps_and_log(llm, web: FakeWebApp) -> None:
+async def test_a_news_flow_run_records_its_log() -> None:
+    from tests.news_fixtures import NewsWeb, seed
+
+    llm = FakeLlm(BudgetGuard(MemorySpendStore()))
+    web = NewsWeb()
     c = memory_container(settings(), llm=llm, web=web, history=True)
+    c.deps.extra["env"] = {"NEWS_DESK_ENABLED": "true"}
+    seed(c.deps.extra["news_store"])
     install(c.history)
     try:
-        r = await kickoff(c, "gsc_sync_flow")
+        r = await kickoff(c, "news_ingest_flow", {"force": True})
     finally:
         uninstall()
     run_id = str(r["run_id"])
-    sink: MemoryHistorySink = c.history.sink
-    steps = [s for s in sink.steps if s["run_id"] == run_id]
-    assert [(s["seq"], s["step"], s["status"]) for s in steps] == [(1, "run_job", "succeeded"), (2, "record_stats", "succeeded")]
-    assert all(s["seconds"] is not None for s in steps)
-    lines = [ln for ln in sink.logs if ln["run_id"] == run_id]
+    assert r["status"] == "succeeded", r
+    lines = [ln for ln in c.history.sink.logs if ln["run_id"] == run_id]
     events = [ln["event"] for ln in lines]
-    assert events[0] == "flow_started" and events[-1] == "flow_finished" and events.count("flow_step") == 2
+    assert events[0] == "flow_started" and events[-1] == "flow_finished"
     by_event = {ln["event"]: ln for ln in lines}
-    assert by_event["flow_started"]["step"] is None and by_event["flow_finished"]["step"] is None  # "Set up" / "Complete"
-    assert {ln["step"] for ln in lines if ln["event"] == "flow_step"} == {"run_job", "record_stats"}
     assert by_event["flow_finished"]["context"]["status"] == "succeeded" and "run_id" not in by_event["flow_finished"]["context"]
 
 
-async def test_a_child_run_logs_into_its_own_run(llm, web: FakeWebApp) -> None:
-    """A flow that starts another (weekly fan-out) runs the kickoff with its own run id in context."""
+async def test_a_child_run_logs_into_its_own_run() -> None:
+    """A flow that starts another (a news job's drafts) runs the kickoff with its own run id in context."""
     from app.runs import CURRENT_RUN_ID
+    from tests.news_fixtures import NewsWeb, seed
 
-    c = memory_container(settings(), llm=llm, web=web, history=True)
+    c = memory_container(settings(), llm=FakeLlm(BudgetGuard(MemorySpendStore())), web=NewsWeb(), history=True)
+    c.deps.extra["env"] = {"NEWS_DESK_ENABLED": "true"}
+    seed(c.deps.extra["news_store"])
     parent = str(uuid.uuid4())
-    await c.store.create({"run_id": parent, "flow_name": "weekly_recommendations_flow", "target_id": "site", "status": "running", "inputs": {}, "triggered_by": "cron"})
+    await c.store.create({"run_id": parent, "flow_name": "news_dispatch_flow", "target_id": "site", "status": "running", "inputs": {}, "triggered_by": "cron"})
     install(c.history)
     try:
         token = CURRENT_RUN_ID.set(parent)
         try:
-            child = (await c.runner.kickoff("gsc_sync_flow", {}, triggered_by="flow", correlation_id=parent))["run_id"]
+            child = (await c.runner.kickoff("news_ingest_flow", {}, triggered_by="flow", correlation_id=parent))["run_id"]
         finally:
             CURRENT_RUN_ID.reset(token)
         await c.runner.wait(child, 30)
@@ -85,21 +89,9 @@ async def test_a_child_run_logs_into_its_own_run(llm, web: FakeWebApp) -> None:
     assert next(ln["event"] for ln in lines if ln["run_id"] == child) == "flow_started"
 
 
-async def test_a_failed_step_is_failed_with_its_error(llm, web: FakeWebApp) -> None:
-    async def boom(*_a: Any) -> dict[str, Any]:
-        raise RuntimeError("search console said no")
-
-    web.run_job = boom  # type: ignore[method-assign]
-    c = memory_container(settings(), llm=llm, web=web, history=True)
-    r = await kickoff(c, "gsc_sync_flow")
-    assert r["status"] == "failed"
-    step = next(s for s in c.history.sink.steps if s["run_id"] == str(r["run_id"]))
-    assert step["step"] == "run_job" and step["status"] == "failed" and "search console said no" in step["error"]
-
-
 async def test_crew_thread_lines_land_in_the_running_step(history: RunHistory) -> None:
     step_id = await history.step_started(RUN, "draft")
-    logger = logging.getLogger("seo_agent.crews")
+    logger = logging.getLogger("news_agent.crews")
 
     def worker() -> None:  # run_in_executor: no context variables, only the run id passed with extra=
         logger.info("crew task started: editorial.writer", extra={"event": "crew_task_started", "agent": "writer", "run_id": RUN})
@@ -116,8 +108,8 @@ async def test_crew_thread_lines_land_in_the_running_step(history: RunHistory) -
 
 
 async def test_lines_of_unknown_runs_and_own_warnings_are_not_kept(history: RunHistory) -> None:
-    logging.getLogger("seo_agent.news").info("news run line", extra={"run_id": str(uuid.uuid4())})  # a news_runs id
-    logging.getLogger("seo_agent.run_history").warning("own", extra={"run_id": RUN})
+    logging.getLogger("news_agent.news").info("news run line", extra={"run_id": str(uuid.uuid4())})  # a news_runs id
+    logging.getLogger("news_agent.run_history").warning("own", extra={"run_id": RUN})
     logging.getLogger("httpx").info("HTTP Request: POST http://web/internal", extra={"run_id": RUN})
     await history.flush()
     assert [(ln["logger"], ln["level"]) for ln in history.sink.logs] == [("httpx", "debug")]
@@ -127,7 +119,7 @@ async def test_exceptions_and_long_values_are_kept_short(history: RunHistory) ->
     try:
         raise ValueError("bad answer")
     except ValueError:
-        logging.getLogger("seo_agent.flows").exception("step failed", extra={"run_id": RUN, "blob": "x" * 40_000})
+        logging.getLogger("news_agent.flows").exception("step failed", extra={"run_id": RUN, "blob": "x" * 40_000})
     await history.flush()
     (line,) = history.sink.logs
     assert line["level"] == "error" and "ValueError: bad answer" in line["context"]["exc"]
@@ -137,7 +129,7 @@ async def test_exceptions_and_long_values_are_kept_short(history: RunHistory) ->
 async def test_a_run_stops_logging_at_the_line_cap(history: RunHistory, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rh, "MAX_LINES_PER_RUN", 3)
     for i in range(10):
-        logging.getLogger("seo_agent.flows").info(f"line {i}", extra={"run_id": RUN})
+        logging.getLogger("news_agent.flows").info(f"line {i}", extra={"run_id": RUN})
     await history.flush()
     assert [ln["message"] for ln in history.sink.logs][:3] == ["line 0", "line 1", "line 2"]
     assert len(history.sink.logs) == 4 and history.sink.logs[-1]["event"] == "log_truncated"
@@ -156,7 +148,7 @@ async def test_without_the_tables_nothing_is_written_or_raised() -> None:
     install(h)
     try:
         assert await h.step_started(RUN, "draft") is None
-        logging.getLogger("seo_agent.flows").info("x", extra={"run_id": RUN})
+        logging.getLogger("news_agent.flows").info("x", extra={"run_id": RUN})
         await h.flush()
         await h.run_finished(RUN, "succeeded")
     finally:
@@ -241,7 +233,7 @@ async def test_calls_outside_a_flow_run_are_not_recorded(history: RunHistory) ->
 async def test_the_writer_runs_in_the_background(history: RunHistory) -> None:
     task = asyncio.create_task(history.run_forever(every_s=0.01))
     try:
-        logging.getLogger("seo_agent.flows").info("queued", extra={"run_id": RUN})
+        logging.getLogger("news_agent.flows").info("queued", extra={"run_id": RUN})
         for _ in range(100):
             if history.sink.logs:
                 break

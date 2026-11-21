@@ -10,7 +10,7 @@ from app.logs import JsonFormatter
 
 
 def record(msg: str, *args: object, exc: bool = False, **extra: object) -> logging.LogRecord:
-    r = logging.LogRecord("seo_agent", logging.WARNING, __file__, 1, msg, args, sys.exc_info() if exc else None)
+    r = logging.LogRecord("news_agent", logging.WARNING, __file__, 1, msg, args, sys.exc_info() if exc else None)
     for key, value in extra.items():
         setattr(r, key, value)
     return r
@@ -19,7 +19,7 @@ def record(msg: str, *args: object, exc: bool = False, **extra: object) -> loggi
 def test_a_message_with_quotes_and_newlines_is_one_valid_json_line() -> None:
     line = JsonFormatter().format(record('article "%s" failed\nsecond line', "ingress-tls"))
     assert "\n" not in line
-    assert json.loads(line) == {"level": "WARNING", "logger": "seo_agent", "msg": 'article "ingress-tls" failed\nsecond line'}
+    assert json.loads(line) == {"level": "WARNING", "logger": "news_agent", "msg": 'article "ingress-tls" failed\nsecond line'}
 
 
 def test_extra_fields_are_logged() -> None:

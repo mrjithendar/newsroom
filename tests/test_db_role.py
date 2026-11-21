@@ -1,4 +1,4 @@
-"""The agent's own database role (scripts/db-role.sql) grants what the SQL in app/ needs, and nothing more.
+"""The news agent's own database role (scripts/db-role.sql) grants what the SQL in app/ needs, and nothing more.
 
 The requirement is read from the code: every string literal in app/ is scanned for `insert into`, `update … set`,
 `delete from`, `from` and `join` followed by the name of a table that exists. The script is then run on a real
@@ -28,31 +28,21 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
 SCRIPT = ROOT / "scripts" / "db-role.sql"
 MIGRATIONS = "src/db/migrations"
-ROLE = "seo_agent"
+ROLE = "news_agent"
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
 
 # Table names the code hands to a statement as a value, and what that statement does with them.
 DYNAMIC: dict[str, set[str]] = {
-    # seo_ml/store.py replace_outputs(): delete every row, insert the new ones
-    "seo_ml_decay_signals": {"SELECT", "INSERT", "DELETE"},
-    "seo_ml_query_clusters": {"SELECT", "INSERT", "DELETE"},
-    "seo_ml_intent_predictions": {"SELECT", "INSERT", "DELETE"},
-    "seo_ml_related_articles": {"SELECT", "INSERT", "DELETE"},
     # news/store.py _profile(): select one row by key
     "news_image_profiles": {"SELECT"},
     "news_writing_profiles": {"SELECT"},
 }
-# The same word as a table, used for something else (mcp/common.py: a key whose value is redacted).
-NOT_A_TABLE = {"api_key"}
+# The same word as a table, used for something else.
+NOT_A_TABLE: set[str] = set()
 # Granted on these columns only, never on the table.
 BY_COLUMN: dict[str, dict[str, set[str]]] = {
-    "user": {"SELECT": {"id", "role", "banned"}},
-    "seo_mcp_grants": {"UPDATE": {"last_used_at"}},
     "seo_flow_schedules": {"UPDATE": {"last_slot", "last_fired_at", "last_status", "last_run_id", "last_error"}},
 }
-# Created by the agent itself (app/index.py) and owned by its role.
-OWNED = ("seo_article_chunks", "seo_article_chunks_next")
-CHUNK_COLUMNS = "(id bigserial primary key, article_id uuid not null references post(id) on delete cascade, chunk_index integer not null)"
 
 
 def literals(path: Path) -> Iterator[str]:
@@ -139,25 +129,26 @@ def test_table_names_passed_as_values_are_all_listed() -> None:
     assert set(DYNAMIC) <= tables
 
 
-def test_the_code_needs_nothing_from_the_sign_in_tables() -> None:
+def test_the_code_needs_nothing_from_the_sign_in_or_seo_tables() -> None:
     wanted = required(migrated_tables())
-    assert wanted.get("post") == {"SELECT"}
-    assert wanted.get("audit_log") == {"INSERT"}
-    assert not {"session", "account", "verification", "api_key", "seo_mcp_clients", "seo_mcp_codes", "page", "site_config", "media"} & set(wanted)
-    # What the column grants in the script rest on.
-    assert wanted.get("user") == {"SELECT"} and wanted.get("seo_mcp_grants") == {"SELECT", "UPDATE"}
+    assert wanted.get("post") == {"SELECT"} and wanted.get("setting") == {"SELECT"}
+    assert not {"session", "account", "verification", "api_key", "user", "page", "site_config", "media", "audit_log"} & set(wanted)
+    # The SEO tables are the seo-agent's; this service books LLM usage and writes its flow runs, nothing else there.
+    seo = {t for t in wanted if t.startswith("seo_")}
+    assert seo == {"seo_drafts", "seo_flow_run_calls", "seo_flow_run_logs", "seo_flow_run_steps", "seo_flow_runs", "seo_flow_schedules", "seo_llm_batches", "seo_llm_usage"}, seo
+    assert wanted["seo_drafts"] == {"SELECT"} and wanted["seo_llm_usage"] == {"INSERT", "SELECT"}
 
 
 def test_the_agents_own_database_url_is_preferred(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.config import load_settings
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://site@db/app")
-    monkeypatch.delenv("SEO_AGENT_DATABASE_URL", raising=False)
+    monkeypatch.delenv("NEWS_AGENT_DATABASE_URL", raising=False)
     assert load_settings().database_url == "postgresql://site@db/app"
-    monkeypatch.setenv("SEO_AGENT_DATABASE_URL", "  ")  # an empty Secret value falls back, it does not break the start
+    monkeypatch.setenv("NEWS_AGENT_DATABASE_URL", "  ")  # an empty Secret value falls back, it does not break the start
     assert load_settings().database_url == "postgresql://site@db/app"
-    monkeypatch.setenv("SEO_AGENT_DATABASE_URL", "postgresql://seo_agent@db/app")
-    assert load_settings().database_url == "postgresql://seo_agent@db/app"
+    monkeypatch.setenv("NEWS_AGENT_DATABASE_URL", "postgresql://news_agent@db/app")
+    assert load_settings().database_url == "postgresql://news_agent@db/app"
 
 
 async def one(c: Any, query: str, *args: object) -> Any:
@@ -167,9 +158,9 @@ async def one(c: Any, query: str, *args: object) -> Any:
 
 @pytest.mark.postgres
 async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
-    url = os.environ.get("SEO_AGENT_TEST_DATABASE_URL")
+    url = os.environ.get("NEWS_AGENT_TEST_DATABASE_URL")
     if not url:
-        pytest.skip("set SEO_AGENT_TEST_DATABASE_URL to check scripts/db-role.sql on a real PostgreSQL")
+        pytest.skip("set NEWS_AGENT_TEST_DATABASE_URL to check scripts/db-role.sql on a real PostgreSQL")
     import psycopg
     from psycopg.conninfo import make_conninfo
     from psycopg.errors import InsufficientPrivilege
@@ -186,8 +177,6 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                 await c.execute("create table schema_migrations (name text primary key, applied_at timestamptz not null default now())")
                 for stmt in migrations:
                     await c.execute(stmt)
-                # As in production today: the index table exists and belongs to the web app's role.
-                await c.execute(f"create table {OWNED[0]} {CHUNK_COLUMNS}")
                 await c.execute(script)
                 await c.execute(script)  # safe to run again
 
@@ -195,7 +184,7 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                 wanted = required(tables)
                 for table, columns in BY_COLUMN.items():
                     wanted[table] = wanted.get(table, set()) - set(columns)
-                for table in sorted(tables - set(OWNED)):
+                for table in sorted(tables):
                     for privilege in PRIVILEGES:
                         has = await one(c, "select has_table_privilege(%s::name, %s::text, %s::text)", ROLE, f'public."{table}"', privilege)
                         if has != (privilege in wanted.get(table, set())):
@@ -208,26 +197,22 @@ async def test_the_role_can_do_what_the_code_does_and_nothing_else() -> None:
                             has = await one(c, "select has_column_privilege(%s::name, %s::text, %s::text, %s::text)", ROLE, f'public."{table}"', column, privilege)
                             if has != (column in allowed):
                                 problems.append(f"{table}.{column}: {privilege} is {'granted' if has else 'missing'}")
-                assert await one(c, "select tableowner from pg_tables where schemaname = 'public' and tablename = %s", OWNED[0]) == ROLE
 
-                # And as the role itself: what the agent does at start-up and during a rebuild works, the rest does not.
+                # And as the role itself: what the agent does works, the rest does not.
                 await c.execute(f"set role {ROLE}")
-                await c.execute(f"alter table {OWNED[0]} add column if not exists title text not null default ''")
-                await c.execute(f"create table {OWNED[1]} {CHUNK_COLUMNS}")
-                await c.execute(f"drop table {OWNED[1]}")
                 await c.execute("select id, title from post limit 1")
-                await c.execute('select id, role, banned from "user" limit 1')
-                await c.execute("insert into audit_log (actor, action, severity) values ('mcp:test', 'seo.mcp.test', 'info')")
+                await c.execute("select value from setting limit 1")
                 for forbidden in (
                     "select 1 from session",
                     "select 1 from account",
-                    'select email from "user"',
+                    'select 1 from "user"',
                     "update post set title = 'changed'",
-                    "delete from audit_log",
-                    "select 1 from audit_log",
-                    "update seo_mcp_grants set revoked_at = null",
-                    "insert into seo_mcp_grants (client_id, user_id, scopes, resource) values ('c', 'u', '{}', 'r')",
                     "update setting set value = '{}'::jsonb",
+                    "select 1 from audit_log",
+                    "select 1 from seo_gsc_page_daily",
+                    "update seo_drafts set status = 'approved'",
+                    "update seo_flow_schedules set enabled = false",
+                    "create table x(id int)",  # no space before "(": the schema contract scan reads test sources
                 ):
                     with pytest.raises(InsufficientPrivilege):
                         await c.execute(forbidden)

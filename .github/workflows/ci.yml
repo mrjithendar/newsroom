@@ -1,23 +1,23 @@
-name: seo-agent
+name: news-agent
 
 # One job per run, on one mk4 runner, so a run never holds more than one runner pod (plus its dind and PostgreSQL):
 #
-# - Every run: ruff, mypy, pytest (with a pgvector PostgreSQL service, so the flow-run, persistence, advisory-lock and
-#   retrieval tests run), the RAG eval smoke, and pip-audit of the locked production dependencies. The moks-cms
-#   contract tests read moks-cms (its migrations, callback routes and shared constants; tests/moks_cms.py). CI has no
-#   moks-cms checkout (no cross-repository credentials, by choice), so they are skipped here: run them locally with
-#   moks-cms checked out next to this repository.
-# - The image (Docker build, model checksums verified inside the build; size check; smoke test of both ports, internal
-#   API 8080 and MCP edge 8090, scripts/smoke-image.sh) is built:
+# - Every run: ruff, mypy, pytest (with a PostgreSQL service, so the run-store scoping, persistence and the news
+#   store tests run), and pip-audit of the locked production dependencies. The moks-cms contract tests read moks-cms
+#   (its migrations, callback routes and shared constants; tests/moks_cms.py). CI has no moks-cms checkout (no
+#   cross-repository credentials, by choice), so they are skipped here: run them locally with moks-cms checked out next
+#   to this repository (or MOKS_CMS_DIR).
+# - The image (Docker build, model checksums verified inside the build; size check; smoke test of the internal API on
+#   8080, scripts/smoke-image.sh) is built:
 #     · on a pull request only when it changes an input of the image beyond the Python code (Dockerfile,
 #       .dockerignore, pyproject.toml, uv.lock, the image scripts or baseline, this workflow). Any other pull request
 #       gets its image built and smoke-tested when it is merged, before anything is pushed;
 #     · on every manual run;
 #     · on a pull request merged into the default branch, from the merge commit, after the checks passed. Only then
-#       is registry.jithendar.com/jithendar/seo-agent:latest pushed. Nothing else: no site is told, each site pulls the
+#       is registry.jithendar.com/jithendar/news-agent:latest pushed. Nothing else: no site is told, each site pulls the
 #       image itself.
 # Nothing here deploys: the manifests and the rollout live in each site's repository (jithendar.com:
-# mrjithendar/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
+# mrjithendar/jithendar.com, kubernetes/news-agent-*.yaml and its deploy workflow).
 #
 # Secrets (repository level: private repositories on GitHub Free cannot read organization secrets):
 #   HARBOR_USERNAME, HARBOR_PASSWORD  the Harbor robot that pushes to project jithendar.
@@ -33,7 +33,7 @@ permissions:
 # A new push to a pull request cancels the run for the commit it replaces. The run for the merge has a group of its
 # own, so it never cancels the pull request's last checks.
 concurrency:
-  group: seo-agent-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'closed' && '-closed' || '' }}
+  group: news-agent-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'closed' && '-closed' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
 
 jobs:
@@ -44,20 +44,20 @@ jobs:
     # Merged pull requests release one at a time (and only the newest waiting one: each merge commit contains the
     # ones before it). Other runs get a group of their own.
     concurrency:
-      group: ${{ github.event.action == 'closed' && github.event.pull_request.base.ref == github.event.repository.default_branch && 'seo-agent-release' || format('seo-agent-run-{0}', github.run_id) }}
+      group: ${{ github.event.action == 'closed' && github.event.pull_request.base.ref == github.event.repository.default_branch && 'news-agent-release' || format('news-agent-run-{0}', github.run_id) }}
       cancel-in-progress: false
     services:
       postgres:
-        # Same pgvector minor as the cluster's CloudNativePG image (0.8.x), PostgreSQL 18. The image smoke test starts
-        # against it too: a database without the web app's tables.
+        # The same image as the seo-agent's CI (pgvector is not used here; PostgreSQL 18 like the cluster). The image
+        # smoke test starts against it too: a database without the web app's tables.
         image: pgvector/pgvector:0.8.1-pg18
         env:
           POSTGRES_PASSWORD: ci-only-not-secret
-          POSTGRES_DB: seo_agent_test
+          POSTGRES_DB: news_agent_test
         ports: ["5432:5432"]
         options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
-      SEO_AGENT_TEST_DATABASE_URL: postgresql://postgres:ci-only-not-secret@localhost:5432/seo_agent_test
+      NEWS_AGENT_TEST_DATABASE_URL: postgresql://postgres:ci-only-not-secret@localhost:5432/news_agent_test
       UV_PYTHON_DOWNLOADS: never
       # The image's thread limits (Dockerfile): without them OpenMP/OpenBLAS (LightGBM, scikit-learn, NumPy) and the
       # tokenizers start one thread per core of the mk4 node, not of the runner pod.
@@ -65,7 +65,7 @@ jobs:
       RAYON_NUM_THREADS: "1"
       TOKENIZERS_PARALLELISM: "false"
       MALLOC_ARENA_MAX: "2"
-      IMAGE: registry.jithendar.com/jithendar/seo-agent:latest
+      IMAGE: registry.jithendar.com/jithendar/news-agent:latest
       MERGED: ${{ github.event.action == 'closed' }}
       # A merge into the default branch: the only run that pushes.
       RELEASE: ${{ github.event.action == 'closed' && github.event.pull_request.base.ref == github.event.repository.default_branch }}
@@ -88,10 +88,8 @@ jobs:
         run: uv run --frozen ruff check app tests
       - name: Types (mypy)
         run: uv run --frozen mypy app
-      - name: Tests (pytest, incl. Postgres + pgvector; the moks-cms contract tests skip without a moks-cms checkout)
+      - name: Tests (pytest, incl. Postgres; the moks-cms contract tests skip without a moks-cms checkout)
         run: uv run --frozen pytest -q -rs
-      - name: RAG eval smoke (hashed embeddings; only that it runs; the real run is rag-eval.yml)
-        run: uv run --frozen python scripts/rag_eval.py --embeddings hash --configs baseline-v4,token-hybrid --dsn "$SEO_AGENT_TEST_DATABASE_URL" --out "$RUNNER_TEMP/rag-eval"
       - name: Dependency audit (pip-audit on the locked production set)
         # Isolated: pip-audit's own dependencies conflict with crewai's pins, so it audits an exported requirements file.
         # The export pins and hashes every transitive dependency, so --disable-pip audits it as is instead of having pip
@@ -103,7 +101,7 @@ jobs:
           uv export --frozen --no-dev --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
           # chromadb 1.5.9 (pinned by crewai, no fixed release): the advisories concern a running Chroma server/client,
           # which this service never starts or connects to (memory=False); it is only imported. Accepted, moks-cms
-          # docs/seo/DECISIONS.md D-53.
+          # docs/seo/DECISIONS.md D-53 (the seo-agent's CI ignores the same four).
           uvx --from "pip-audit==2.10.1" pip-audit --strict --progress-spinner off --disable-pip \
             --cache-dir "$RUNNER_TEMP/pip-audit-cache" -r "$RUNNER_TEMP/requirements.txt" \
             --ignore-vuln PYSEC-2026-311 --ignore-vuln PYSEC-2026-3813 --ignore-vuln PYSEC-2026-3814 --ignore-vuln PYSEC-2026-3815
@@ -133,7 +131,7 @@ jobs:
       # Never push an image that cannot start: this is the image that is pushed, not a rebuild of it.
       - name: Image smoke test
         if: steps.image.outputs.build == 'true'
-        run: scripts/smoke-image.sh "$IMAGE" "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
+        run: scripts/smoke-image.sh "$IMAGE" "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/news_agent_test"
       # Pushed only from the merge commit of a pull request merged into the default branch, after every step above passed.
       - name: Log in to Harbor
         if: env.RELEASE == 'true'

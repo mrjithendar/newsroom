@@ -1,5 +1,7 @@
 """Similarity cutoffs per embeddings model.
 
+Forked from moks-seo-agent/app/calibration.py@bb9e553 on 2026-11-21.
+
 A cosine of 0.80 means something different for every model: bge-small packs related texts into a narrow band near 1,
 bge-m3 spreads them out. Every cutoff that compares two vectors is therefore a property of the model that made them,
 and changing EMBEDDINGS_PROVIDER / OLLAMA_EMBED_MODEL must change the cutoffs with it. This table is where they live.

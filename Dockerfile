@@ -1,6 +1,6 @@
-# seo-agent (docs/seo/FLOWS.md, MCP.md). Multi-stage, non-root, CPU-only: no torch, no CUDA; ONNX Runtime runs the
-# embeddings; ReportLab (pure Python) renders the report PDFs. The one system library is libgomp1 (OpenMP), which the
-# LightGBM wheel links against for the news desk ranker (docs/news/ML.md); scikit-learn/SciPy wheels bundle their own.
+# news-agent (docs/ARCHITECTURE.md). Multi-stage, non-root, CPU-only: no torch, no CUDA; ONNX Runtime runs the
+# embeddings the news desk clusters and dedupes with. The one system library is libgomp1 (OpenMP), which the LightGBM
+# wheel links against for the ranker (docs/ML.md); scikit-learn/SciPy wheels bundle their own.
 # The embeddings model (BAAI/bge-small-en-v1.5, ONNX export, MIT) is baked in at a pinned revision and verified by
 # sha256, so pods never download anything at start-up and the image is reproducible.
 ARG PYTHON_VERSION=3.13
@@ -17,7 +17,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # through the collections API, missing tenant checks, SimpleRBAC) all need that server running. This service only
 # imports chromadb's client-side types, so the server is removed from the image: the Rust bindings (the `chroma run`
 # server, 50 MB), the Python server, CLI and app, the basic-auth and RBAC providers, and the `chroma` command.
-# docs/seo/DECISIONS.md D-53; tests/test_chromadb_surface.py fails if the service ever imports any of them.
+# moks-seo-agent docs/seo/DECISIONS.md D-53 (the same removal; this service imports none of them either).
 RUN sp="$(echo /srv/.venv/lib/python3.*/site-packages)" \
  && rm -rf "$sp/chromadb_rust_bindings" "$sp/chromadb/server" "$sp/chromadb/cli" "$sp/chromadb/app.py" \
            "$sp/chromadb/auth/basic_authn" "$sp/chromadb/auth/simple_rbac_authz" /srv/.venv/bin/chroma \
@@ -46,6 +46,6 @@ ENV PATH=/srv/.venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     CREWAI_DISABLE_TELEMETRY=true CREWAI_DISABLE_TRACKING=true CREWAI_TRACING_ENABLED=false CREWAI_DISABLE_VERSION_CHECK=true \
     CREWAI_STORAGE_DIR=/tmp/crewai
 USER 10001:10001
-# 8080 internal API (web app, trigger CronJobs, Prometheus) · 8090 MCP edge (Kong only)
-EXPOSE 8080 8090
+# 8080 internal API (web app, the dispatcher CronJob, Prometheus). No MCP edge.
+EXPOSE 8080
 CMD ["python", "-m", "app.main"]

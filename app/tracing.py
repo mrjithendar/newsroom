@@ -1,7 +1,10 @@
 """OpenTelemetry tracing to the cluster's existing collector (OTLP/HTTP, OTEL_EXPORTER_OTLP_ENDPOINT, e.g.
 http://otel-collector.observability:4318 → Jaeger, like the web app). One span per flow step (flow.<flow>.<step>) and
 per crew run (crew.<name>). No endpoint → spans are created but not exported. CrewAI's own tracing and telemetry stay
-off (config.py)."""
+off (config.py).
+
+Forked from moks-seo-agent/app/tracing.py@bb9e553 on 2026-11-21.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +14,7 @@ from typing import Any
 
 from opentelemetry import trace
 
-_tracer = trace.get_tracer("seo-agent")
+_tracer = trace.get_tracer("news-agent")
 
 
 def setup_tracing(endpoint: str, service_name: str, version: str = "dev") -> bool:
@@ -30,7 +33,7 @@ def setup_tracing(endpoint: str, service_name: str, version: str = "dev") -> boo
 
 @contextmanager
 def span(name: str, attrs: dict[str, Any] | None = None) -> Iterator[Any]:
-    with trace.get_tracer("seo-agent").start_as_current_span(name, attributes={k: str(v) for k, v in (attrs or {}).items()}) as s:
+    with trace.get_tracer("news-agent").start_as_current_span(name, attributes={k: str(v) for k, v in (attrs or {}).items()}) as s:
         try:
             yield s
         except Exception as e:
@@ -45,7 +48,7 @@ def emit_span(name: str, *, start_ns: int, attrs: dict[str, Any] | None = None, 
     span (span() above) would be attached in one context and detached in another, so the span is emitted once the call
     is booked. Numbers stay numeric (Jaeger range queries); None values are dropped."""
     clean = {k: (v if isinstance(v, (bool, int, float, str)) else str(v)) for k, v in (attrs or {}).items() if v is not None}
-    s = trace.get_tracer("seo-agent").start_span(name, start_time=start_ns, attributes=clean)
+    s = trace.get_tracer("news-agent").start_span(name, start_time=start_ns, attributes=clean)
     if error:
         s.set_status(trace.Status(trace.StatusCode.ERROR, error))
     s.end()

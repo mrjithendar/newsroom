@@ -1,15 +1,15 @@
 """Agent skills (D-96, docs/seo/CREWS.md "Skills"): guidance each crew agent gets in its system prompt.
 
+Forked from moks-seo-agent/app/crews/skills.py@bb9e553 on 2026-11-21.
+
 Where they come from: the web app (AI room → Skills; moks-cms/src/lib/seo-agent/skills.ts) serves the enabled
 skills at GET /internal/seo-agent/skills: the shipped defaults (which an admin may have edited) and the admin's own.
 `run_crew` reads them once per run (`fetch`) and `build_agents` gives each agent the ones that match it (`select`).
 
 Which skills a run gets is decided here, in code, never by the model. A skill names its agents ("editorial.writer",
 or "news.*" for a whole crew) and, optionally, tags: without tags it applies to every run of its agents; with tags,
-when the run has any one of them. Each crew derives its run's tags from the ML and Search Console signals it already
-carries (`editorial_tags`, `optimization_tags`, `news_tags`, `report_tags`): the brief's intent (the editorial idea's,
-or the ML intent model's for the item's queries), the calendar idea's source (ML query clusters, Google Analytics, Ask
-the Blog), the recommendation categories, the news classifier's topics.
+when the run has any one of them. The news crew derives its run's tags (`news_tags`) from the story: the mode, the
+news classifier's topics, a CVE id, a release. The SEO crews' tags are the seo-agent's (moks-seo-agent/app/crews/skills.py).
 
 Skills are passed to CrewAI already activated (INSTRUCTIONS level), so CrewAI renders their full text into the agent's
 system prompt, which ClaudeCrewLLM sends as the cached system block. That means no `load_skill` tool: it would sit
@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger("seo_agent.crews")
+log = logging.getLogger("news_agent.crews")
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _BLOCK_RE = re.compile(r"</?\s*skill\b", re.I)
@@ -122,7 +122,7 @@ def to_crewai(skills: list[AgentSkill]) -> list[Any]:
         return []
     from crewai.skills.models import INSTRUCTIONS, Skill, SkillFrontmatter
 
-    return [Skill(frontmatter=SkillFrontmatter(name=s.name, description=s.description), instructions=s.instructions, path=Path("/seo-agent-skills") / s.name, disclosure_level=INSTRUCTIONS) for s in skills]
+    return [Skill(frontmatter=SkillFrontmatter(name=s.name, description=s.description), instructions=s.instructions, path=Path("/news-agent-skills") / s.name, disclosure_level=INSTRUCTIONS) for s in skills]
 
 
 # --- a run's tags, from the signals each crew already has ---------------------------------------------------------------
@@ -135,39 +135,6 @@ def _v(value: Any) -> str:
 
 _INTENT_ALIASES = {"how-to": "how-to", "howto": "how-to", "how to": "how-to", "tutorial": "how-to"}
 _EXPLAIN_RE = re.compile(r"^\s*(what|why)\b", re.I)
-
-
-def editorial_tags(brief: Mapping[str, Any]) -> set[str]:
-    """intent:<…> (the brief's, or the ML intent model's: the web app fills it in for items without one), source:<…>
-    (the calendar idea's origin), queries:many (≥ 3 supporting queries), revise (Improve: a current draft)."""
-    tags: set[str] = set()
-    raw = str(brief.get("intent") or "").strip().lower()
-    intent = _INTENT_ALIASES.get(raw, _v(raw))
-    queries = [str(q).strip() for q in (brief.get("supportingQueries") or []) if str(q).strip()]
-    if intent:
-        tags.add(f"intent:{intent}")
-        if intent == "informational":
-            # The ML intent model does not split "how to do X" from "what is X"; the main query (or title) does.
-            main = queries[0] if queries else str(brief.get("title") or "")
-            tags.add("intent:explainer" if _EXPLAIN_RE.match(main) else "intent:how-to")
-    source = _v(brief.get("source") or "")
-    if source:
-        tags.add(f"source:{source}")
-    if len(queries) >= 3:
-        tags.add("queries:many")
-    if str(brief.get("currentDraft") or "").strip():
-        tags.add("revise")
-    return tags
-
-
-def optimization_tags(recommendations: Iterable[Mapping[str, Any]]) -> set[str]:
-    """category:<…> for every category of the recommendations being implemented."""
-    tags: set[str] = set()
-    for r in recommendations:
-        for c in [r.get("category"), *(r.get("categories") or [])]:
-            if c and _v(c):
-                tags.add(f"category:{_v(c)}")
-    return tags
 
 
 _CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.I)
@@ -188,8 +155,3 @@ def news_tags(brief: Mapping[str, Any], items: Iterable[Mapping[str, Any]] = ())
     if any(_VERSION_RE.search(t) or _RELEASE_RE.search(t) or re.search(r"\bGA\b", t) for t in titles):
         tags.add("release")
     return tags
-
-
-def report_tags(report: Mapping[str, Any]) -> set[str]:
-    """report:<weekly|monthly>."""
-    return {f"report:{_v(report.get('type') or 'weekly')}"}
