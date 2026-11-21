@@ -15,8 +15,12 @@ Every endpoint except /healthz, /readyz and /metrics needs `Authorization: Beare
     POST /review/{draft_id}/decision    {approve|reject|regenerate, approval_id, accepted_change_ids, edits, feedback}
     POST /ask                           public RAG, proxied by the web app (rate-limited there)
     GET  /budget
-    GET  /llm-budgets                   limits per model and provider, spend today and this month (app/llm_budgets.py)
-    PUT  /llm-budgets                   {models, providers, actor} → the whole set, or 422
+    GET  /llm-budget?scope=day|month    the one LLM budget: spent, limit, remaining, forecast, spend by provider, model, purpose
+    PUT  /llm-budget                    {daily_usd, monthly_usd, actor} → the budget, or 422 (app/llm_budgets.py)
+    POST /llm-budget/reserve            {max_usd, purpose} → {id}: hold a call's upper bound against the budget, or 402
+    POST /llm-budget/settle             {id} → let go of a hold (the caller has recorded its usage row)
+    GET  /llm-budgets                   before the one budget: spend by model and provider, no limits (older web app)
+    PUT  /llm-budgets                   409: replaced by /llm-budget
     GET  /admin-settings                settings an admin may change: schema, effective values, source, restart pending
     PUT  /admin-settings/{group}        {values, actor} → one group, validated, all or nothing (app/admin_settings)
     GET  /healthz /readyz /metrics
@@ -29,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import math
 import os
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -63,8 +69,8 @@ from .index import MemoryRetriever, PgVectorIndex
 from .lance_admin import LanceAdmin, LanceError
 from .lance_admin import from_env as lance_from_env
 from .lance_index import ArticleMirror, fetch_from
-from .llm import AnthropicLlm, BudgetGuard, MemorySpendStore, PgSpendStore
-from .llm_budgets import BudgetsIn, MemoryBudgets, PgBudgets
+from .llm import AnthropicLlm, BudgetExceeded, BudgetGuard, MemorySpendStore, PgSpendStore
+from .llm_budgets import REPLACED, BudgetIn, MemoryBudget, PgBudget, legacy_overview
 from .llm_budgets import overview as llm_overview
 from .logs import configure_logging
 from .news.store import MemoryNewsStore, PgNewsStore
@@ -146,7 +152,7 @@ class Container:
     history: RunHistory | None = None  # steps, log lines and model calls of every flow run (app/run_history.py)
     schedules: Any = field(default_factory=MemoryScheduleStore)  # seo_flow_schedules (app/schedules.py)
     clock: Callable[[], Any] | None = None  # tests: the dispatcher's "now"
-    budgets: Any = field(default_factory=MemoryBudgets)  # LLM budgets per model and provider (app/llm_budgets.py)
+    budgets: Any = field(default_factory=MemoryBudget)  # the one LLM budget (app/llm_budgets.py)
     admin_settings: Any = field(default_factory=MemorySettingsStore)  # values saved from the admin (app/admin_settings)
 
     async def reindex(self, article_ids: list[str] | None = None, full: bool = False, force: bool = False) -> dict[str, int]:
@@ -231,8 +237,8 @@ async def build_container(settings: Settings) -> Container:
     except Exception as e:  # the role cannot create the table, or the database is down: the deployment's values
         settings_note = f"admin settings table not available: {type(e).__name__}"
         log.warning("admin settings not loaded", extra={"event": "admin_settings_load_failed"})
-    budgets = PgBudgets(pool)
-    guard = BudgetGuard(PgSpendStore(pool), settings.monthly_budget_usd, settings.ask_daily_budget_usd, limits=budgets)
+    budgets = PgBudget(pool)
+    guard = BudgetGuard(PgSpendStore(pool), None, settings.ask_daily_budget_usd, budget=budgets)
     web = HttpWebApp(settings.callback_url, settings.callback_token)
     history = RunHistory(PgHistorySink(pool), web.run_history_settings)
     llm = RecordingLlm(AnthropicLlm(settings.anthropic_api_key, guard, timeout_s=settings.llm_timeout_s), history)
@@ -278,10 +284,10 @@ def memory_container(settings: Settings, *, llm: Any, web: Any, retriever: Any =
     _ml(deps, MemoryMlStore(), HashEmbeddings())
     runner = FlowRunner(SPECS, store, MemoryLocks(), lambda: MemoryFlowPersistence().bind(store), deps, timeout_s=settings.flow_timeout_s, policy=check_kickoff)
     deps.runner = runner
-    guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), settings.monthly_budget_usd, settings.ask_daily_budget_usd))
+    guard = getattr(llm, "guard", BudgetGuard(MemorySpendStore(), None, settings.ask_daily_budget_usd))
     ask = AskService(AskPipeline(deps), retriever, MemoryAskLog(), settings.ask_enabled, settings.ask_cache_ttl_s, runtime=StaticAskRuntime(), guard=guard)
-    budgets = guard.limits if isinstance(guard.limits, MemoryBudgets) else MemoryBudgets()
-    guard.limits = budgets
+    budgets = guard.budget if isinstance(guard.budget, MemoryBudget) else MemoryBudget()
+    guard.budget = budgets
     c = Container(settings=settings, deps=deps, runner=runner, store=store, ask=ask, index=retriever, guard=guard, ready=True, history=run_history, budgets=budgets)
     deps.reindex = c.reindex
     return c
@@ -342,8 +348,9 @@ async def _gauges(c: Container) -> None:
     while True:
         try:
             st = await c.guard.status()
-            if c.settings.monthly_budget_usd > 0:
-                metrics.BUDGET_RATIO.set(st["month_spend_usd"] / c.settings.monthly_budget_usd)
+            # The one LLM budget: the month's share when a monthly limit is set, else the day's, else 0 (no limit).
+            ratios = [st[f"{u}_spend_usd"] / lim for u, lim in (("month", st["monthly_budget_usd"]), ("day", st["daily_budget_usd"])) if lim]
+            metrics.BUDGET_RATIO.set(ratios[0] if ratios else 0.0)
             ask_budget = getattr(c.guard, "ask_daily_usd", c.settings.ask_daily_budget_usd)  # the admin's budget once a question has applied it
             if ask_budget > 0:
                 metrics.ASK_BUDGET_RATIO.set(st["ask_day_spend_usd"] / ask_budget)
@@ -565,27 +572,72 @@ def create_app(container: Container | None = None) -> FastAPI:
         return await ctr(request).lance.run("delete", name, body.key_column, body.key, actor=body.actor)
 
     @app.get("/budget", dependencies=[Depends(auth)])
-    async def budget(request: Request) -> dict[str, float]:
+    async def budget(request: Request) -> dict[str, Any]:
         return await ctr(request).guard.status()
+
+    @app.get("/llm-budget", dependencies=[Depends(auth)])
+    async def llm_budget(request: Request, scope: str = "month") -> Any:
+        if scope not in ("day", "month"):
+            return JSONResponse({"error": "scope is day or month"}, status_code=422)
+        c = ctr(request)
+        out = await llm_overview(await c.budgets.budget(), c.guard.store, c.guard.clock(), scope, c.guard.pending["total"])  # type: ignore[arg-type]
+        now = c.guard.clock()
+        out["ask_daily"] = {"limit_usd": c.guard.ask_daily_usd, "spent_usd": round(await c.guard.store.day_spend(now, "ask"), 6)}
+        out["legacy_limits"] = await c.budgets.legacy()
+        return out
+
+    @app.put("/llm-budget", dependencies=[Depends(auth)])
+    async def save_llm_budget(request: Request) -> Any:
+        try:
+            body = BudgetIn.model_validate(await request.json())
+        except ValidationError as e:
+            issues = [f"{'.'.join(str(p) for p in err['loc']) or 'body'}: {err['msg']}" for err in e.errors()][:30]
+            return JSONResponse({"error": "the LLM budget is not valid", "issues": issues}, status_code=422)
+        except ValueError:
+            return JSONResponse({"error": "send a JSON object"}, status_code=422)
+        c = ctr(request)
+        saved = await c.budgets.save(body.budget(), body.actor)
+        log.info("llm budget saved", extra={"event": "llm_budget_saved", "daily_usd": saved.daily_usd, "monthly_usd": saved.monthly_usd})
+        return {"budget": saved.out()}
+
+    @app.post("/llm-budget/reserve", dependencies=[Depends(auth)])
+    async def reserve_llm_budget(request: Request) -> Any:
+        """For LLM calls made outside this service (the web app's own): check the one budget and hold the call's
+        upper bound until it is settled. 402 with the reason when it does not fit; the caller then does not call."""
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        asked = body if isinstance(body, dict) else {}
+        max_usd, purpose = asked.get("max_usd"), asked.get("purpose")
+        if isinstance(max_usd, bool) or not isinstance(max_usd, (int, float)) or not math.isfinite(max_usd) or not 0 <= max_usd <= 1000:
+            return JSONResponse({"error": "max_usd is the call's upper bound in USD (0 to 1000)"}, status_code=422)
+        if not isinstance(purpose, str) or not re.fullmatch(r"[a-z][a-z0-9_.\-]{1,60}", purpose):
+            return JSONResponse({"error": "purpose names what the call is for (lower-case, e.g. ai_visibility)"}, status_code=422)
+        try:
+            return {"id": await ctr(request).guard.hold(float(max_usd), purpose)}
+        except BudgetExceeded as e:
+            return JSONResponse({"error": e.detail, "scope": e.scope}, status_code=402)
+
+    @app.post("/llm-budget/settle", dependencies=[Depends(auth)])
+    async def settle_llm_budget(request: Request) -> Any:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        key = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{32}", key):
+            return JSONResponse({"error": "id is the hold's id from /llm-budget/reserve"}, status_code=422)
+        return {"released": ctr(request).guard.settle(key)}
 
     @app.get("/llm-budgets", dependencies=[Depends(auth)])
     async def llm_budgets(request: Request) -> dict[str, Any]:
         c = ctr(request)
-        return await llm_overview(await c.budgets.limits(), c.guard.store, c.guard.clock())
+        return await legacy_overview(c.guard.store, c.guard.clock())
 
     @app.put("/llm-budgets", dependencies=[Depends(auth)])
-    async def save_llm_budgets(request: Request) -> Any:
-        try:
-            body = BudgetsIn.model_validate(await request.json())
-        except ValidationError as e:
-            issues = [f"{'.'.join(str(p) for p in err['loc']) or 'body'}: {err['msg']}" for err in e.errors()][:30]
-            return JSONResponse({"error": "the LLM budgets are not valid", "issues": issues}, status_code=422)
-        except ValueError:
-            return JSONResponse({"error": "send a JSON object"}, status_code=422)
-        c = ctr(request)
-        saved = await c.budgets.save(body.limits(), body.actor)
-        log.info("llm budgets saved", extra={"event": "llm_budgets_saved", "models": len(saved.models), "providers": len(saved.providers)})
-        return {"budgets": saved.out()}
+    async def save_llm_budgets() -> Any:
+        return JSONResponse({"error": REPLACED}, status_code=409)
 
     @app.get("/admin-settings", dependencies=[Depends(auth)])
     async def admin_settings(request: Request) -> dict[str, Any]:
