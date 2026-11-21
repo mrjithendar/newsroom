@@ -1,23 +1,20 @@
-"""News budgets (docs/news/COSTS.md): per job and global, daily and monthly, separately for LLM and image spend.
+"""News budgets (docs/news/COSTS.md).
 
-Checked *before* every LLM call (upper-bound estimate: input chars / 3.5 + full max_tokens) and before every image
-generation; when a call would cross a cap, nothing is sent, `BudgetExceeded` is raised and the run ends as
-`paused_budget` with the cap named in its error. Days and months are calendar periods in the job's time zone (global
-caps: UTC). Spend is read from news_runs (cost_usd / image_cost_usd), which every call updates as it completes.
-LLM calls reserve their estimate first (`NewsBudget.reserve`: booked on the run's row under a lock, then verified),
-so concurrent calls cannot all pass the same check and jointly overspend; the reservation is released when the call
-ends and the actual cost is booked.
+**LLM spend has no cap of its own.** Since the one LLM budget (app/llm_budgets.py, plan P5) every news LLM call is
+checked and held by the service's BudgetGuard like any other call: `NewsLlm` only names the purpose "news.*" and
+books the cost to the news run. The per-job and global `llm_daily_usd` / `llm_monthly_usd` values may still sit in
+saved rows; nothing reads them.
 
-News LLM usage is also recorded in seo_llm_usage (purpose "news.*") for the shared usage page, but it is excluded from
-the SEO admin monthly cap (app/llm.py BudgetGuard, web budgetState), so the news desk can never pause SEO drafting.
+**Image spend keeps its caps** (per job and global, daily and monthly). They are checked before every image
+generation; when one would be crossed nothing is sent, `BudgetExceeded` is raised and the run ends as
+`paused_budget` with the cap named. Days and months are calendar periods in the job's time zone (global caps: UTC).
+Spend is read from news_runs (cost_usd / image_cost_usd), which every call updates as it completes.
 """
 
 from __future__ import annotations
 
-import asyncio
-import weakref
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo
@@ -43,24 +40,6 @@ def period_starts(now: datetime, tz: str) -> tuple[datetime, datetime]:
 
 
 @dataclass
-class _LoopState:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    pending: float = 0.0
-
-
-_STATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _LoopState] = weakref.WeakKeyDictionary()
-
-
-def _loop_state() -> _LoopState:
-    """One reservation lock per event loop (an asyncio.Lock is bound to the loop that first waits on it)."""
-    loop = asyncio.get_running_loop()
-    st = _STATES.get(loop)
-    if st is None:
-        st = _STATES[loop] = _LoopState()
-    return st
-
-
-@dataclass
 class NewsBudget:
     store: NewsStore
     settings: NewsSettings
@@ -74,18 +53,20 @@ class NewsBudget:
         gd, gm = period_starts(now, "UTC")
         g_day, g_month = await self.store.spend(None, gd), await self.store.spend(None, gm)
         out: dict[str, Any] = {
-            "global": {"llm_day": g_day["llm"], "llm_month": g_month["llm"], "image_day": g_day["image"], "image_month": g_month["image"], "caps": {"llm_day": self.settings.llm_daily_usd, "llm_month": self.settings.llm_monthly_usd, "image_day": self.settings.image_daily_usd, "image_month": self.settings.image_monthly_usd}},
+            "global": {"llm_day": g_day["llm"], "llm_month": g_month["llm"], "image_day": g_day["image"], "image_month": g_month["image"], "caps": {"llm_day": None, "llm_month": None, "image_day": self.settings.image_daily_usd, "image_month": self.settings.image_monthly_usd}},
         }
         if self.job:
             jd, jm = period_starts(now, self.job.timezone)
             d, m = await self.store.spend(self.job.id, jd), await self.store.spend(self.job.id, jm)
             b = self.job.config.budget
-            out["job"] = {"llm_day": d["llm"], "llm_month": m["llm"], "image_day": d["image"], "image_month": m["image"], "caps": {"llm_day": b.llm_daily_usd, "llm_month": b.llm_monthly_usd, "image_day": b.image_daily_usd, "image_month": b.image_monthly_usd}}
+            out["job"] = {"llm_day": d["llm"], "llm_month": m["llm"], "image_day": d["image"], "image_month": m["image"], "caps": {"llm_day": None, "llm_month": None, "image_day": b.image_daily_usd, "image_month": b.image_monthly_usd}}
         return out
 
     async def check(self, kind: str, estimate_usd: float, *, booked: bool = False) -> None:
         """kind: llm | image. Raises BudgetExceeded naming the first cap the estimate would cross. booked: the estimate
         is already included in the recorded spend (a reservation)."""
+        if kind == "llm":
+            return  # no news cap on LLM spend: the one LLM budget checks every call (app/llm.py BudgetGuard)
         st = await self.status()
         checks = [("global", "day"), ("global", "month")] + ([("job", "day"), ("job", "month")] if self.job else [])
         for scope, period in checks:
@@ -95,37 +76,15 @@ class NewsBudget:
                 raise BudgetExceeded(f"news_{scope}_{kind}_{period}", f"{'this job' if scope == 'job' else 'the news desk'}'s {'daily' if period == 'day' else 'monthly'} {kind.upper() if kind == 'llm' else 'image'} budget ${cap:.2f} would be exceeded (spent ${spent:.2f}, this call ≈ ${estimate_usd:.3f})")
 
     async def reserve(self, kind: str, estimate_usd: float) -> float:
-        """Check-and-reserve, atomically: under a per-event-loop lock, the estimate is booked on this run's news_runs row
-        (so every process sees it in `spend`), then the caps are verified with the reservation included. Over a cap the
-        reservation is released and BudgetExceeded raised, so concurrent calls can never jointly overspend; across
-        processes the worst case is a spurious refusal, never an overrun. Returns the reserved amount (to `settle`).
-        Without a run row to book on (run_id empty) it falls back to an in-process pending total."""
+        """Image spend: checks the image caps. LLM spend: nothing to do here, the one LLM budget holds the call's
+        upper bound itself (BudgetGuard.reserve inside the service's Llm). Returns the amount to `settle` (always 0)."""
         if kind != "llm":
             await self.check(kind, estimate_usd)
-            return 0.0
-        state = _loop_state()
-        async with state.lock:
-            if not self.run_id:
-                await self.check(kind, estimate_usd + state.pending)
-                state.pending += estimate_usd
-                return estimate_usd
-            await self.store.add_run_cost(self.run_id, usd=estimate_usd)
-            try:
-                await self.check(kind, estimate_usd, booked=True)
-            except BudgetExceeded:
-                await self.store.add_run_cost(self.run_id, usd=-estimate_usd)
-                raise
-            return estimate_usd
+        return 0.0
 
     async def settle(self, reserved: float) -> None:
-        """Release a reservation (the caller books the actual cost separately)."""
-        if reserved <= 0:
-            return
-        if not self.run_id:
-            state = _loop_state()
-            state.pending = max(0.0, state.pending - reserved)
-            return
-        await self.store.add_run_cost(self.run_id, usd=-reserved)
+        """Kept for callers; nothing is held here any more."""
+        return None
 
     async def ratios(self) -> dict[str, float]:
         st = await self.status()
@@ -134,12 +93,15 @@ class NewsBudget:
             if scope in st:
                 for k in ("llm_day", "llm_month", "image_day", "image_month"):
                     cap = st[scope]["caps"][k]
+                    if cap is None:
+                        continue  # LLM spend: no news cap, so no ratio
                     out[f"{scope}_{k}"] = round(st[scope][k] / cap, 4) if cap else 0.0
         return out
 
 
 class NewsLlm:
-    """The service's Llm with the news caps in front and the cost booked to the news run (and its parent)."""
+    """The service's Llm for the news desk: names the purpose "news.*" and books the cost to the news run (and its
+    parent). The one LLM budget is checked inside the service's Llm; there is no news LLM cap in front of it."""
 
     def __init__(self, inner: Llm, budget: NewsBudget, run_ids: list[str], *, enabled: bool = True):
         self.inner = inner

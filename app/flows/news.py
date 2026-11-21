@@ -25,7 +25,7 @@ from crewai.flow import persist, start
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import metrics
-from ..llm import BudgetExceeded
+from ..llm import BudgetExceeded, used_up
 from ..news import desk as nd
 from ..news.budget import NewsBudget, NewsLlm
 from ..news.config import Job, load_news_settings
@@ -233,8 +233,10 @@ class NewsJobFlow(NewsHelpers, SeoFlow[NewsJobState]):
             ratios = await budget.ratios()
             for k, v in ratios.items():
                 metrics.NEWS_BUDGET_RATIO.labels(scope=k).set(v)
-            if not s.dry_run and (ratios.get("job_llm_day", 0) >= 1 or ratios.get("global_llm_day", 0) >= 1 or ratios.get("job_llm_month", 0) >= 1 or ratios.get("global_llm_month", 0) >= 1):
-                raise BudgetExceeded("news", "an LLM budget cap is already reached")
+            # The one LLM budget (no news cap of its own): a job does not start drafting when it is already used up.
+            guard = getattr(self.deps.llm, "guard", None)
+            if not s.dry_run and guard is not None and used_up(await guard.status()):
+                raise BudgetExceeded("llm", "the LLM budget is used up (Admin → AI & SEO → Settings → LLM budget)")
             ingest_lock: asyncio.Lock = d.extra.setdefault("news_ingest_lock", asyncio.Lock())
             async with ingest_lock:  # ingestion is shared: one at a time; a source fetched within its interval is skipped
                 # Ingest's Claude topic fallback is shared work: capped by the global news budget, booked to this run.

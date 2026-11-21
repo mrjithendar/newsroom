@@ -174,8 +174,12 @@ async def test_safe_ai_image_is_marked_ai_generated(llm: Any) -> None:
 
 
 async def test_budget_cap_pauses_the_job_without_drafting(llm: Any) -> None:
-    c, web, store = setup(llm, job_cfg={"budget": {"llm_daily_usd": 0.01}})
-    store.runs["old"] = {"id": "old", "job_id": JOB, "status": "succeeded", "cost_usd": 0.02, "image_cost_usd": 0.0, "started_at": NOW, "tokens": 0, "counters": {}}
+    from app.llm_budgets import Budget
+
+    # The one LLM budget is used up (there is no per-job news LLM cap any more; an old value in the job is ignored).
+    c, web, store = setup(llm, job_cfg={"budget": {"llm_daily_usd": 100}})
+    llm.guard.budget.value = Budget(daily_usd=0.01)
+    llm.guard.store.preexisting_usd = 0.02
     fr = await run(c, "news_job_flow", {"job_id": JOB})
     assert fr["status"] == "paused_budget"
     nr = news_run(store, fr)
