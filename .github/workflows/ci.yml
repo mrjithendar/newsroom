@@ -1,18 +1,23 @@
 name: seo-agent
 
-# check   → pull requests and manual runs: ruff, mypy, pytest (with a pgvector PostgreSQL service, so the flow-run,
-#           persistence, advisory-lock and retrieval tests run), pip-audit of the locked production dependencies, and a
-#           Docker build of the image (model checksums verified inside the build) with a smoke test of both ports
-#           (internal API 8080, MCP edge 8090; scripts/smoke-image.sh). The contract tests read moks-cms (its
-#           migrations, callback routes and shared constants; tests/moks_cms.py). CI has no moks-cms checkout (no
-#           cross-repository credentials, by choice), so they are skipped here: run them locally with moks-cms checked
-#           out next to this repository. On a merged pull request `check` runs only the tests (on the merge commit):
-#           the image is built once, by `release`.
-# release → a merged pull request: build arm64 and smoke-test it while `check` runs, then push
-#           registry.jithendar.com/jithendar/seo-agent:latest once `check` has passed (scripts/wait-for-jobs.sh).
-#           Nothing else: no site is told, each site pulls the image itself.
+# One job per run, on one mk4 runner, so a run never holds more than one runner pod (plus its dind and PostgreSQL):
+#
+# - Every run: ruff, mypy, pytest (with a pgvector PostgreSQL service, so the flow-run, persistence, advisory-lock and
+#   retrieval tests run), the RAG eval smoke, and pip-audit of the locked production dependencies. The moks-cms
+#   contract tests read moks-cms (its migrations, callback routes and shared constants; tests/moks_cms.py). CI has no
+#   moks-cms checkout (no cross-repository credentials, by choice), so they are skipped here: run them locally with
+#   moks-cms checked out next to this repository.
+# - The image (Docker build, model checksums verified inside the build; size check; smoke test of both ports, internal
+#   API 8080 and MCP edge 8090, scripts/smoke-image.sh) is built:
+#     · on a pull request only when it changes an input of the image beyond the Python code (Dockerfile,
+#       .dockerignore, pyproject.toml, uv.lock, the image scripts or baseline, this workflow). Any other pull request
+#       gets its image built and smoke-tested when it is merged, before anything is pushed;
+#     · on every manual run;
+#     · on a pull request merged into the default branch, from the merge commit, after the checks passed. Only then
+#       is registry.jithendar.com/jithendar/seo-agent:latest pushed. Nothing else: no site is told, each site pulls the
+#       image itself.
 # Nothing here deploys: the manifests and the rollout live in each site's repository (jithendar.com:
-# moks-tech/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
+# mrjithendar/jithendar.com, kubernetes/seo-agent-*.yaml and its deploy workflow).
 #
 # Secrets (repository level: private repositories on GitHub Free cannot read organization secrets):
 #   HARBOR_USERNAME, HARBOR_PASSWORD  the Harbor robot that pushes to project jithendar.
@@ -26,19 +31,25 @@ permissions:
   contents: read
 
 # A new push to a pull request cancels the run for the commit it replaces. The run for the merge has a group of its
-# own, so it never cancels the pull request's last checks; releases go one at a time through the `release` job's group.
+# own, so it never cancels the pull request's last checks.
 concurrency:
   group: seo-agent-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'closed' && '-closed' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
 
 jobs:
-  check:
+  ci:
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && (github.event.action != 'closed' || github.event.pull_request.merged == true))
     runs-on: mk4
-    timeout-minutes: 25
+    timeout-minutes: 30
+    # Merged pull requests release one at a time (and only the newest waiting one: each merge commit contains the
+    # ones before it). Other runs get a group of their own.
+    concurrency:
+      group: ${{ github.event.action == 'closed' && github.event.pull_request.base.ref == github.event.repository.default_branch && 'seo-agent-release' || format('seo-agent-run-{0}', github.run_id) }}
+      cancel-in-progress: false
     services:
       postgres:
-        # Same pgvector minor as the cluster's CloudNativePG image (0.8.x), PostgreSQL 18.
+        # Same pgvector minor as the cluster's CloudNativePG image (0.8.x), PostgreSQL 18. The image smoke test starts
+        # against it too: a database without the web app's tables.
         image: pgvector/pgvector:0.8.1-pg18
         env:
           POSTGRES_PASSWORD: ci-only-not-secret
@@ -48,12 +59,24 @@ jobs:
     env:
       SEO_AGENT_TEST_DATABASE_URL: postgresql://postgres:ci-only-not-secret@localhost:5432/seo_agent_test
       UV_PYTHON_DOWNLOADS: never
+      # The image's thread limits (Dockerfile): without them OpenMP/OpenBLAS (LightGBM, scikit-learn, NumPy) and the
+      # tokenizers start one thread per core of the mk4 node, not of the runner pod.
+      OMP_NUM_THREADS: "2"
+      RAYON_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      MALLOC_ARENA_MAX: "2"
+      IMAGE: registry.jithendar.com/jithendar/seo-agent:latest
+      MERGED: ${{ github.event.action == 'closed' }}
+      # A merge into the default branch: the only run that pushes.
+      RELEASE: ${{ github.event.action == 'closed' && github.event.pull_request.base.ref == github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # A merged pull request is built from its merge commit on the default branch.
           ref: ${{ github.event.action == 'closed' && github.event.pull_request.merge_commit_sha || '' }}
+          # The parent too: a pull request's merge ref is diffed against its base (first parent) below.
+          fetch-depth: 2
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
@@ -71,68 +94,49 @@ jobs:
         run: uv run --frozen python scripts/rag_eval.py --embeddings hash --configs baseline-v4,token-hybrid --dsn "$SEO_AGENT_TEST_DATABASE_URL" --out "$RUNNER_TEMP/rag-eval"
       - name: Dependency audit (pip-audit on the locked production set)
         # Isolated: pip-audit's own dependencies conflict with crewai's pins, so it audits an exported requirements file.
+        # The export pins and hashes every transitive dependency, so --disable-pip audits it as is instead of having pip
+        # resolve all of it again in a throwaway virtualenv. --cache-dir: pip-audit's default cache (platformdirs, under
+        # ~/.cache) refuses a world-writable home directory, which the mk4 runner image has ("PermissionError:
+        # /home/runner, writable by another user").
         run: |
           set -euo pipefail
-          uv export --frozen --no-dev --no-hashes --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
+          uv export --frozen --no-dev --format requirements-txt > "$RUNNER_TEMP/requirements.txt"
           # chromadb 1.5.9 (pinned by crewai, no fixed release): the advisories concern a running Chroma server/client,
           # which this service never starts or connects to (memory=False); it is only imported. Accepted, moks-cms
           # docs/seo/DECISIONS.md D-53.
-          uvx --from "pip-audit==2.10.1" pip-audit --strict --progress-spinner off -r "$RUNNER_TEMP/requirements.txt" \
+          uvx --from "pip-audit==2.10.1" pip-audit --strict --progress-spinner off --disable-pip \
+            --cache-dir "$RUNNER_TEMP/pip-audit-cache" -r "$RUNNER_TEMP/requirements.txt" \
             --ignore-vuln PYSEC-2026-311 --ignore-vuln PYSEC-2026-3813 --ignore-vuln PYSEC-2026-3814 --ignore-vuln PYSEC-2026-3815
-      # Image steps: pull requests and manual runs only. A merged pull request's image is built (once) by `release`.
-      - name: Build the image (no push)
-        if: github.event.action != 'closed'
-        run: docker build --provenance=false -t seo-agent:ci .
-      - name: Image size (summary; fails above +15 % of the stored baseline)
-        if: github.event.action != 'closed'
-        run: scripts/image-size.sh seo-agent:ci image-size-baseline.json
-      - name: Image smoke test
-        if: github.event.action != 'closed'
-        run: scripts/smoke-image.sh seo-agent:ci "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
-
-  # Starts with `check` instead of after it: the build and smoke test (~1.5 min) run while the tests do, and the push
-  # waits for `check` to pass.
-  release:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == github.event.repository.default_branch
-    runs-on: mk4
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      # scripts/wait-for-jobs.sh reads this run's `check` job.
-      actions: read
-    concurrency:
-      group: seo-agent-release
-      cancel-in-progress: false
-    # For the smoke test: the image must start against a database without the web app's tables (as in `check`).
-    services:
-      postgres:
-        image: pgvector/pgvector:0.8.1-pg18
+      - name: Build the image or not
+        id: image
         env:
-          POSTGRES_PASSWORD: ci-only-not-secret
-          POSTGRES_DB: seo_agent_test
-        ports: ["5432:5432"]
-        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
-    env:
-      IMAGE: registry.jithendar.com/jithendar/seo-agent:latest
-      RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          # A merged pull request is built from its merge commit on the default branch.
-          ref: ${{ env.RELEASE_SHA }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          build=true
+          if [[ "$MERGED" == true ]]; then
+            build="$RELEASE"
+          elif [[ "$EVENT" == pull_request ]] && git diff --quiet HEAD^1 HEAD -- \
+              Dockerfile .dockerignore pyproject.toml uv.lock image-size-baseline.json scripts/image-size.sh \
+              scripts/smoke-image.sh .github/workflows/ci.yml; then
+            build=false
+            echo "No input of the image changed: it is built and smoke-tested when this pull request is merged, before it is pushed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
       - name: Build the image
-        # Only :latest: sites run :latest and restart the agent on each release.
+        if: steps.image.outputs.build == 'true'
+        # Only :latest: sites run :latest and restart the agent on each release. Tagged here, pushed only on a merge.
         run: docker build --platform linux/arm64 --provenance=false -t "$IMAGE" .
+      - name: Image size (summary; fails above +15 % of the stored baseline)
+        if: steps.image.outputs.build == 'true' && env.MERGED != 'true'
+        run: scripts/image-size.sh "$IMAGE" image-size-baseline.json
       # Never push an image that cannot start: this is the image that is pushed, not a rebuild of it.
       - name: Image smoke test
+        if: steps.image.outputs.build == 'true'
         run: scripts/smoke-image.sh "$IMAGE" "postgresql://postgres:ci-only-not-secret@host.docker.internal:5432/seo_agent_test"
-      # Nothing is pushed unless `check` (ruff, mypy, pytest, pip-audit on the merge commit) passed.
-      - name: Wait for check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: scripts/wait-for-jobs.sh 1 check
+      # Pushed only from the merge commit of a pull request merged into the default branch, after every step above passed.
       - name: Log in to Harbor
+        if: env.RELEASE == 'true'
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
@@ -141,10 +145,14 @@ jobs:
           [[ -n "$HARBOR_USERNAME" && -n "$HARBOR_PASSWORD" ]] || { echo "::error::Secrets HARBOR_USERNAME and HARBOR_PASSWORD must be set"; exit 1; }
           printf '%s' "$HARBOR_PASSWORD" | docker login registry.jithendar.com --username "$HARBOR_USERNAME" --password-stdin
       - name: Push
+        if: env.RELEASE == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
           docker push --quiet "$IMAGE"
           {
             echo "- $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
-            echo "- pull request #${{ github.event.pull_request.number }}, commit $RELEASE_SHA"
+            echo "- pull request #$PR_NUMBER, commit $RELEASE_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
