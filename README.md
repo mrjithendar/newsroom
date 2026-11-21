@@ -54,7 +54,8 @@ both repositories. A path written as `moks-cms/<path>` or `moks-seo-agent/<path>
 | `NEWS_AGENT_CALLBACK_TOKEN`, `NEWS_AGENT_CALLBACK_URL` | This service → the web app's callback API (default `http://jithendar-com-internal.jithendar:9465`) |
 | `SEO_AGENT_URL`, `SEO_AGENT_NEWS_TOKEN` | This service → the seo-agent (site search, LLM budget). Both empty: neither. |
 | `DATABASE_URL`, `NEWS_AGENT_DATABASE_URL` | The shared database; the second (its own role, `scripts/db-role.sql`) wins when set |
-| `ANTHROPIC_API_KEY` | Claude. Use a key of its own Anthropic Console workspace, with that workspace's spend limit. |
+| `ANTHROPIC_API_KEY` | Claude. Use a key of its own Anthropic Console workspace, with that workspace's spend limit. A key saved in Newsroom → Settings → News agent wins over it. |
+| `NEWS_AGENT_SETTINGS_KEY` | Seals the secrets an admin saves (32+ characters; without it secret fields are read-only). Rotating it makes them unreadable. |
 | `OPENAI_API_KEY` | Only for the `openai` cover provider |
 | `NEWS_DESK_ENABLED` | `false` forces the desk off whatever the admin switch says; unset lets the admin decide |
 | `NEWS_IMAGE_PROVIDER`, `NEWS_OPENAI_IMAGE_MODEL` | Cover provider override and the OpenAI image model |
@@ -66,6 +67,15 @@ both repositories. A path written as `moks-cms/<path>` or `moks-seo-agent/<path>
 
 Everything else the desk does (sources, jobs, profiles, topics, caps, models, thresholds) is set in the web app's
 Admin → Newsroom and read from the database.
+
+## Settings an admin can change
+
+`app/admin_settings` (forked from the seo-agent's): the Claude key (sealed with `NEWS_AGENT_SETTINGS_KEY`), the crews'
+default models and limits, and the embeddings connection, in this service's own table `news_agent_settings` (created
+at start-up). The admin's saved value wins over the environment variable, which wins over the default in
+app/config.py; clearing a field goes back to the deployment's value. `GET /admin-settings`, `PUT /admin-settings/{group}`;
+the web app shows them in Newsroom → Settings → News agent. Tokens, URLs, the database and `NEWS_DESK_ENABLED` can never
+be set there.
 
 ## Local development
 
@@ -80,7 +90,8 @@ The contract tests read moks-cms (its migrations, the callback server's route ta
 routes, the skills list). They find it at `$MOKS_CMS_DIR` or in `../moks-cms`, and are skipped otherwise; CI has no
 moks-cms checkout (no cross-repository credentials, by choice), so run them locally when a change touches the callbacks,
 the news tables or the skills. `NEWS_AGENT_TEST_DATABASE_URL` (a PostgreSQL superuser URL) runs the real-database tests:
-the news store against every migration, the run-store scoping and the database role. On a Mac without Homebrew's
+the news store against every migration, the run-store scoping and the database role. `tests/test_seo_agent_contract.py`
+reads the seo-agent (`$SEO_AGENT_DIR` or `../moks-seo-agent`) for the routes and shapes `app/seo_agent.py` uses. On a Mac without Homebrew's
 `libomp` the LightGBM ranker tests fail to load the library; CI (Linux) runs them.
 
 ## Database role

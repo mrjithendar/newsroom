@@ -37,8 +37,9 @@ BEGIN
   END LOOP;
 END $$;
 
--- No CREATE: the news agent owns no table. Sequences: ids of the rows it inserts.
-GRANT USAGE ON SCHEMA public TO news_agent;
+-- CREATE: the agent creates its one table itself at start-up (news_agent_settings, below). Sequences: ids of the rows
+-- it inserts.
+GRANT USAGE, CREATE ON SCHEMA public TO news_agent;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO news_agent;
 
 -- Read only: published posts (duplicates, performance), the Newsroom settings row, review drafts (usage attribution),
@@ -74,3 +75,18 @@ GRANT UPDATE (last_slot, last_fired_at, last_status, last_run_id, last_error) ON
 GRANT SELECT, INSERT, UPDATE ON seo_flow_run_steps TO news_agent;
 GRANT INSERT ON seo_flow_run_logs TO news_agent;
 GRANT SELECT, INSERT ON seo_flow_run_calls TO news_agent;
+
+-- The agent's own table: the settings an admin saved (app/admin_settings, Newsroom → Settings → News agent). The agent
+-- creates it at start-up; if it already exists (created while the agent still used the web app's role), it is handed
+-- over. The site's role keeps full access to it and to whatever the agent creates later.
+DO $$
+DECLARE
+  site_role name;
+BEGIN
+  SELECT tableowner INTO STRICT site_role FROM pg_tables WHERE schemaname = 'public' AND tablename = 'post';
+  IF to_regclass('public.news_agent_settings') IS NOT NULL THEN
+    ALTER TABLE public.news_agent_settings OWNER TO news_agent;
+    EXECUTE format('GRANT ALL ON public.news_agent_settings TO %I', site_role);
+  END IF;
+  EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE news_agent IN SCHEMA public GRANT ALL ON TABLES TO %I', site_role);
+END $$;
