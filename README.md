@@ -74,6 +74,19 @@ provider's own spend limit stops spending.
   "Fetch models", "Test", and the model for each job come in later changes; until then Anthropic cannot be switched
   off here.
 
+## LLM adapters
+
+`app/llm_adapters/`: thin `httpx` clients for providers other than Anthropic (no LiteLLM, no vendor SDKs). An adapter
+knows one API shape and nothing about the budget, prices or usage rows; the caller books what it returns.
+
+- `openai_compat.py`: Chat Completions for OpenAI and every compatible server (`Authorization: Bearer`, Azure's
+  `api-key` header, or no key for a local server). Structured answers use `response_format` `json_schema` where the
+  endpoint supports it, else JSON mode, else plain text; every answer is validated against the Pydantic model here
+  and gets one repair request before it is refused. Retries 408/409/429/5xx and connection errors twice. Errors
+  carry the provider's message and code, never the key or the prompt. `list_models()` reads `GET /models`.
+- Not yet: images, streaming, tools; and **nothing calls an adapter yet**. Wiring behind the budget guard, with the
+  admin's prices, is a later change.
+
 ## Settings an admin can change
 
 Some settings can be changed from the web app (Admin → AI & SEO → Settings) instead of the deployment's environment.
