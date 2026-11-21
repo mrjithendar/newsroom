@@ -129,6 +129,12 @@ They live in `app/admin_settings/`:
    environment before `load_settings` runs.
 5. Add the group's fields to `tests/test_admin_settings.py` (which are live, which need a restart).
 
+
+Groups so far: **Agent limits**; **Embeddings** (the backend's address, key and time limit; the provider and model
+stay in the deployment until a guarded re-embed exists); **Retrieval** (passages per answer, lowest similarity,
+how long questions are kept, the LanceDB copy); **MCP servers** (the two switches, live; their rate limits and
+allowed hosts, on restart). Ask the Blog's own switch, audience, daily limit and cache time stay in Ask the Blog.
+
 ## CI and release
 
 - `.github/workflows/ci.yml` is one job on one mk4 runner. On every run it runs lint, types, tests (without the
